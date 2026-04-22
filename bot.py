@@ -166,6 +166,32 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Использование: /find <хеш>")
+        return
+    tx_hash = args[0].strip()
+    await update.message.reply_text(f"🔍 Ищу: {tx_hash[:20]}...\nДлина: {len(tx_hash)} символов")
+    try:
+        spreadsheet = get_spreadsheet()
+        for sheet in spreadsheet.worksheets():
+            rows = sheet.get_all_values()
+            for i, row in enumerate(rows):
+                for j, cell in enumerate(row):
+                    if cell.strip().lower() == tx_hash.lower():
+                        await update.message.reply_text(
+                            f"✅ Найден!\nЛист: {sheet.title}\nСтрока: {i+1}, Столбец: {j+1}\nЗначение ячейки: <code>{cell}</code>",
+                            parse_mode="HTML"
+                        )
+                        return
+        await update.message.reply_text("❌ Не найден ни в одном листе")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
@@ -201,6 +227,7 @@ async def post_init(application):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("recheck", recheck_command))
     app.add_handler(CommandHandler("status", status_command))
