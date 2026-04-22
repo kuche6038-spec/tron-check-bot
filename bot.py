@@ -4,7 +4,7 @@ import re
 import os
 import json
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import gspread
 from google.oauth2.service_account import Credentials
@@ -173,6 +173,69 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    keyboard = [
+        [KeyboardButton("🔄 Перепроверить"), KeyboardButton("📊 Статистика")],
+        [KeyboardButton("📋 Статус очереди"), KeyboardButton("🔍 Список листов")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
+    await update.message.reply_text("✅ Панель управления активна!", reply_markup=reply_markup)
+
+
+async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    text = update.message.text
+
+    if text == "🔄 Перепроверить":
+        if not pending_checks:
+            await update.message.reply_text("📋 Очередь пуста — нечего перепроверять.")
+            return
+        await update.message.reply_text(f"🔄 Проверяю {len(pending_checks)} хешей...")
+        found_count, not_found_list = 0, []
+        for tx_hash, data in list(pending_checks.items()):
+            if check_hash(tx_hash):
+                found_count += 1
+                pending_checks.pop(tx_hash, None)
+            else:
+                not_found_list.append((tx_hash, data))
+        await update.message.reply_text(
+            f"✅ Готово!\nНайдено и обработано: {found_count}\nНе найдено (остались в очереди): {len(not_found_list)}"
+        )
+
+    elif text == "📊 Статистика":
+        text_msg = (
+            f"📊 <b>Статистика</b>\n\n"
+            f"❌ Не найдено за всё время: <b>{not_found_total}</b>\n"
+            f"⏳ Сейчас в очереди: <b>{len(pending_checks)}</b>"
+        )
+        await update.message.reply_text(text_msg, parse_mode="HTML")
+
+    elif text == "📋 Статус очереди":
+        if not pending_checks:
+            await update.message.reply_text("📋 Очередь пуста.")
+            return
+        lines = [f"📋 В очереди: <b>{len(pending_checks)}</b> хешей\n"]
+        for tx_hash, data in pending_checks.items():
+            sec = max(0, int((data["check_at"] - datetime.now()).total_seconds()))
+            lines.append(f"• <code>{tx_hash[:20]}...</code> — через {sec//3600}ч {(sec%3600)//60}м")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    elif text == "🔍 Список листов":
+        try:
+            spreadsheet = get_spreadsheet()
+            sheets = spreadsheet.worksheets()
+            lines = [f"📊 Листов: <b>{len(sheets)}</b>\n"]
+            for sheet in sheets:
+                rows = sheet.get_all_values()
+                lines.append(f"• <b>{sheet.title}</b> — {len(rows)} строк")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
@@ -308,7 +371,9 @@ async def post_init(application):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🔄 Перепроверить|📊 Статистика|📋 Статус очереди|🔍 Список листов)$") & ~filters.COMMAND, keyboard_handler))
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(CommandHandler("debug", debug_command))
