@@ -408,14 +408,30 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Файл hashes.txt не найден.")
         return
 
-    total = len(hashes)
-    await update.message.reply_text(f"🔄 Начинаю проверку {total} хешей из истории чата...\nЭто займёт несколько минут.")
+    # Загружаем прогресс если был прерван
+    progress_file = 'checkall_progress.json'
+    progress = {}
+    try:
+        with open(progress_file, 'r') as f:
+            progress = json.load(f)
+        start_index = progress.get('last_index', 0)
+        found_count = progress.get('found_count', 0)
+        not_found = progress.get('not_found', [])
+        errors = progress.get('errors', [])
+        if start_index > 0:
+            await update.message.reply_text(f"⏩ Продолжаю с места остановки (хеш #{start_index + 1})...")
+    except (FileNotFoundError, json.JSONDecodeError):
+        start_index = 0
+        found_count = 0
+        not_found = []
+        errors = []
 
-    found_count = 0
-    not_found = []
-    errors = []
+    total = len(hashes)
+    await update.message.reply_text(f"🔄 Проверяю {total} хешей...\nОсталось: {total - start_index}")
 
     for i, tx_hash in enumerate(hashes):
+        if i < start_index:
+            continue
         try:
             sheet, row_index, _ = find_hash_in_all_sheets(tx_hash)
             if sheet and row_index:
@@ -435,6 +451,16 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             errors.append(tx_hash)
             logger.error(f"Ошибка при проверке {tx_hash[:20]}: {e}")
 
+        # Сохраняем прогресс после каждого хеша
+        progress = {
+            'last_index': i + 1,
+            'found_count': found_count,
+            'not_found': not_found,
+            'errors': errors
+        }
+        with open(progress_file, 'w') as pf:
+            json.dump(progress, pf)
+
         # Пауза между запросами — защита от лимитов API
         await asyncio.sleep(1.5)
 
@@ -446,14 +472,30 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Не найдено: {len(not_found)}"
             )
 
-    await update.message.reply_text(
+    # Удаляем файл прогресса — задача завершена
+    import os
+    if os.path.exists(progress_file):
+        os.remove(progress_file)
+
+    summary = (
         f"✅ <b>Проверка завершена!</b>\n\n"
         f"Всего хешей: {total}\n"
         f"Найдено и обработано: {found_count}\n"
         f"Не найдено в таблице: {len(not_found)}\n"
-        f"Ошибок: {len(errors)}",
-        parse_mode="HTML"
+        f"Ошибок: {len(errors)}"
     )
+    await update.message.reply_text(summary, parse_mode="HTML")
+
+    # Отправляем список не найденных хешей
+    if not_found:
+        # Разбиваем на части по 50 хешей чтобы не превысить лимит сообщения
+        chunk_size = 50
+        for idx in range(0, len(not_found), chunk_size):
+            chunk = not_found[idx:idx + chunk_size]
+            lines = [f"❌ <b>Не найдено ({idx+1}-{idx+len(chunk)} из {len(not_found)}):</b>\n"]
+            for h in chunk:
+                lines.append(f"<code>{h}</code>")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
