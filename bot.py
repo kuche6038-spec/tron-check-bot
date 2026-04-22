@@ -165,6 +165,21 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Не найдено (остались в очереди): {len(not_found_list)}"
     )
 
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    try:
+        spreadsheet = get_spreadsheet()
+        sheets = spreadsheet.worksheets()
+        lines = [f"📊 Таблица открыта. Листов: {len(sheets)}\n"]
+        for sheet in sheets:
+            rows = sheet.get_all_values()
+            lines.append(f"• <b>{sheet.title}</b> — {len(rows)} строк")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
@@ -186,6 +201,7 @@ async def post_init(application):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("recheck", recheck_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
