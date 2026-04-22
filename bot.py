@@ -395,6 +395,66 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
 
+
+async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/checkall — проверить список хешей из файла hashes.txt"""
+    if update.message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        with open('hashes.txt', 'r') as f:
+            hashes = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        await update.message.reply_text("❌ Файл hashes.txt не найден.")
+        return
+
+    total = len(hashes)
+    await update.message.reply_text(f"🔄 Начинаю проверку {total} хешей из истории чата...\nЭто займёт несколько минут.")
+
+    found_count = 0
+    not_found = []
+    errors = []
+
+    for i, tx_hash in enumerate(hashes):
+        try:
+            sheet, row_index, _ = find_hash_in_all_sheets(tx_hash)
+            if sheet and row_index:
+                row = sheet.row_values(row_index)
+                status = row[13] if len(row) > 13 else ""
+                if not status:
+                    mark_as_processed(sheet, row_index)
+                    result = await verify_and_write_tron_data(sheet, row_index, tx_hash)
+                    found_count += 1
+                    logger.info(f"[{i+1}/{total}] Найден и обработан: {tx_hash[:20]}... — {result}")
+                else:
+                    found_count += 1
+                    logger.info(f"[{i+1}/{total}] Уже обработан: {tx_hash[:20]}...")
+            else:
+                not_found.append(tx_hash)
+        except Exception as e:
+            errors.append(tx_hash)
+            logger.error(f"Ошибка при проверке {tx_hash[:20]}: {e}")
+
+        # Пауза между запросами — защита от лимитов API
+        await asyncio.sleep(1.5)
+
+        # Отправляем промежуточный отчёт каждые 100 хешей
+        if (i + 1) % 100 == 0:
+            await update.message.reply_text(
+                f"⏳ Прогресс: {i+1}/{total}\n"
+                f"✅ Найдено: {found_count}\n"
+                f"❌ Не найдено: {len(not_found)}"
+            )
+
+    await update.message.reply_text(
+        f"✅ <b>Проверка завершена!</b>\n\n"
+        f"Всего хешей: {total}\n"
+        f"Найдено и обработано: {found_count}\n"
+        f"Не найдено в таблице: {len(not_found)}\n"
+        f"Ошибок: {len(errors)}",
+        parse_mode="HTML"
+    )
+
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
@@ -458,6 +518,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🔄 Перепроверить|📊 Статистика|📋 Статус очереди|🔍 Список листов)$") & ~filters.COMMAND, keyboard_handler))
+    app.add_handler(CommandHandler("checkall", checkall_command))
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(CommandHandler("debug", debug_command))
