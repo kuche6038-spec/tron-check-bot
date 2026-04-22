@@ -120,8 +120,10 @@ async def delayed_check_loop(application):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    # Ищем hex-строку от 63 до 66 символов (TRON хеши бывают разной длины)
-    match = re.search(r'\b([0-9a-fA-F]{63,66})\b', update.message.text.strip())
+    # Убираем все пробелы и переносы строк из текста перед поиском
+    clean_text = re.sub(r'\s+', '', update.message.text.strip())
+    # Ищем hex-строку от 63 до 66 символов
+    match = re.search(r'([0-9a-fA-F]{63,66})', clean_text)
     if not match:
         return
 
