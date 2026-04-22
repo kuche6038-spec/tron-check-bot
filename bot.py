@@ -3,6 +3,7 @@ import asyncio
 import re
 import os
 import json
+import aiohttp
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -15,7 +16,9 @@ from google.oauth2.service_account import Credentials
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID        = int(os.environ["ADMIN_ID"])
 SPREADSHEET_ID  = os.environ["SPREADSHEET_ID"]
-CHECK_DELAY_HOURS = 12
+CHECK_DELAY_HOURS = 1
+TRON_API_KEY = "3a47f76f-f6aa-412c-9651-824df43c2d09"
+TRON_WALLET = "TX6z5khTbArfSSV4b2yioUxhMytyWBNjC8"
 
 # Колонки (считаем с 1)
 COL_DATE   = 11  # K
@@ -76,6 +79,86 @@ def check_hash(tx_hash: str) -> bool:
         logger.error(f"Ошибка при проверке хеша {tx_hash}: {e}")
         return False
 
+async def check_hash_with_tron(tx_hash: str) -> bool:
+    """Проверяет хеш в таблице + верифицирует через TRON API"""
+    try:
+        sheet, row_index, _ = find_hash_in_all_sheets(tx_hash)
+        if sheet and row_index:
+            mark_as_processed(sheet, row_index)
+            result = await verify_and_write_tron_data(sheet, row_index, tx_hash)
+            logger.info(f"TRON проверка хеша {tx_hash[:20]}: {result}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка при проверке хеша {tx_hash}: {e}")
+        return False
+
+
+# ========================
+# TRON API
+# ========================
+async def get_tron_transaction(tx_hash: str) -> dict:
+    """Получает данные транзакции из Tronscan API"""
+    url = f"https://apilist.tronscanapi.com/api/transaction-info?hash={tx_hash}"
+    headers = {"TRON-PRO-API-KEY": TRON_API_KEY}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+    except Exception as e:
+        logger.error(f"Ошибка TRON API: {e}")
+    return {}
+
+async def verify_and_write_tron_data(sheet, row_index: int, tx_hash: str) -> str:
+    """
+    Проверяет транзакцию через Tronscan.
+    Записывает сумму в колонку O, результат проверки адреса в P.
+    Возвращает строку с результатом для логов.
+    """
+    data = await get_tron_transaction(tx_hash)
+    if not data or data.get("contractRet") == "FAILED":
+        sheet.update_cell(row_index, 15, "⚠️ не найдена в сети")  # O
+        sheet.update_cell(row_index, 16, "—")                      # P
+        return "не найдена в сети"
+
+    # Получаем сумму — ищем USDT трансфер
+    amount = ""
+    to_address = ""
+
+    trc20_transfers = data.get("trc20TransferInfo", [])
+    if trc20_transfers:
+        transfer = trc20_transfers[0]
+        raw_amount = transfer.get("amount_str", transfer.get("amount", "0"))
+        decimals = int(transfer.get("decimals", 6))
+        try:
+            amount = str(round(int(raw_amount) / (10 ** decimals), 2))
+        except:
+            amount = str(raw_amount)
+        to_address = transfer.get("to_address", "")
+    else:
+        # TRX транзакция
+        raw_amount = data.get("amount", 0)
+        try:
+            amount = str(round(int(raw_amount) / 1_000_000, 2))
+        except:
+            amount = str(raw_amount)
+        contract_data = data.get("contractData", {})
+        to_address = contract_data.get("to_address", "")
+
+    # Записываем сумму в O
+    sheet.update_cell(row_index, 15, amount)
+
+    # Проверяем адрес и записываем результат в P
+    if to_address.lower() == TRON_WALLET.lower():
+        sheet.update_cell(row_index, 16, "✅ Адрес верный")
+        addr_result = "адрес верный"
+    else:
+        sheet.update_cell(row_index, 16, f"❌ Адрес неверный: {to_address}")
+        addr_result = f"адрес неверный ({to_address})"
+
+    return f"сумма: {amount}, {addr_result}"
+
 # ========================
 # ОЧЕРЕДЬ ОТЛОЖЕННЫХ ХЕШЕЙ
 # ========================
@@ -95,7 +178,7 @@ async def delayed_check_loop(application):
             if now < data["check_at"]:
                 continue
             logger.info(f"Отложенная проверка: {tx_hash}")
-            found = check_hash(tx_hash)
+            found = await check_hash_with_tron(tx_hash)
             if not found:
                 global not_found_total
                 not_found_total += 1
@@ -137,7 +220,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     logger.info(f"Хеш от юзера {user_id}: {tx_hash}")
 
-    if not check_hash(tx_hash):
+    found = await check_hash_with_tron(tx_hash)
+    if not found:
         logger.info(f"Не найден, очередь на {CHECK_DELAY_HOURS}ч")
         pending_checks[tx_hash] = {
             "user_id": user_id,
@@ -158,7 +242,7 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_count, not_found_list = 0, []
 
     for tx_hash, data in list(pending_checks.items()):
-        if check_hash(tx_hash):
+        if await check_hash_with_tron(tx_hash):
             found_count += 1
             pending_checks.pop(tx_hash, None)
         else:
@@ -197,7 +281,7 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔄 Проверяю {len(pending_checks)} хешей...")
         found_count, not_found_list = 0, []
         for tx_hash, data in list(pending_checks.items()):
-            if check_hash(tx_hash):
+            if await check_hash_with_tron(tx_hash):
                 found_count += 1
                 pending_checks.pop(tx_hash, None)
             else:
@@ -271,7 +355,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"🔄 Проверяю {len(pending_checks)} хешей...")
         found_count, not_found_list = 0, []
         for tx_hash, data in list(pending_checks.items()):
-            if check_hash(tx_hash):
+            if await check_hash_with_tron(tx_hash):
                 found_count += 1
                 pending_checks.pop(tx_hash, None)
             else:
