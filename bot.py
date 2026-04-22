@@ -52,13 +52,27 @@ def get_spreadsheet():
 
 def find_hash_in_all_sheets(tx_hash: str):
     """
-    Ищет хеш в колонке M по всем листам с названием оканчивающимся на 'сбив'.
+    Ищет хеш во всех листах.
     Возвращает (sheet, row_index, row_data) или (None, None, None).
     """
+    import time
     spreadsheet = get_spreadsheet()
     for sheet in spreadsheet.worksheets():
         logger.info(f"Проверяю лист: '{sheet.title}'")
-        for i, row in enumerate(sheet.get_all_values()):
+        for attempt in range(3):
+            try:
+                all_rows = sheet.get_all_values()
+                break
+            except Exception as e:
+                if '429' in str(e) or 'RATE_LIMIT' in str(e) or 'Quota' in str(e):
+                    wait = 60 * (attempt + 1)
+                    logger.warning(f"Лимит API, жду {wait}с...")
+                    time.sleep(wait)
+                else:
+                    raise
+        else:
+            continue
+        for i, row in enumerate(all_rows):
             for j, cell in enumerate(row):
                 if cell.strip().lower() == tx_hash.lower():
                     logger.info(f"Найден на листе '{sheet.title}', строка {i + 1}, столбец {j + 1}")
@@ -461,8 +475,8 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(progress_file, 'w') as pf:
             json.dump(progress, pf)
 
-        # Пауза между запросами — защита от лимитов API
-        await asyncio.sleep(1.5)
+        # Пауза между запросами — защита от лимитов API (60 req/min = 1 req/sec)
+        await asyncio.sleep(3)
 
         # Отправляем промежуточный отчёт каждые 100 хешей
         if (i + 1) % 100 == 0:
