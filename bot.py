@@ -4,8 +4,8 @@ import re
 import os
 import json
 from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -80,6 +80,7 @@ def check_hash(tx_hash: str) -> bool:
 # ОЧЕРЕДЬ ОТЛОЖЕННЫХ ХЕШЕЙ
 # ========================
 pending_checks: dict = {}
+not_found_total: int = 0  # счётчик всех не найденных за всё время
 
 # ========================
 # ФОНОВЫЙ ЦИКЛ
@@ -96,6 +97,8 @@ async def delayed_check_loop(application):
             logger.info(f"Отложенная проверка: {tx_hash}")
             found = check_hash(tx_hash)
             if not found:
+                global not_found_total
+                not_found_total += 1
                 try:
                     await application.bot.send_message(
                         chat_id=data["user_id"],
@@ -169,6 +172,82 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Перепроверить очередь", callback_data="recheck"),
+        ],
+        [
+            InlineKeyboardButton("📋 Статус очереди", callback_data="status"),
+            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("🔍 Список листов", callback_data="debug"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🤖 Панель управления ботом:", reply_markup=reply_markup)
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Нет доступа")
+        return
+
+    await query.answer()
+    action = query.data
+
+    if action == "recheck":
+        if not pending_checks:
+            await query.edit_message_text("📋 Очередь пуста — нечего перепроверять.")
+            return
+        await query.edit_message_text(f"🔄 Проверяю {len(pending_checks)} хешей...")
+        found_count, not_found_list = 0, []
+        for tx_hash, data in list(pending_checks.items()):
+            if check_hash(tx_hash):
+                found_count += 1
+                pending_checks.pop(tx_hash, None)
+            else:
+                not_found_list.append((tx_hash, data))
+        await query.edit_message_text(
+            f"✅ Готово!\nНайдено и обработано: {found_count}\nНе найдено (остались в очереди): {len(not_found_list)}"
+        )
+
+    elif action == "status":
+        if not pending_checks:
+            await query.edit_message_text("📋 Очередь пуста.")
+            return
+        lines = [f"📋 В очереди: <b>{len(pending_checks)}</b> хешей\n"]
+        for tx_hash, data in pending_checks.items():
+            sec = max(0, int((data["check_at"] - datetime.now()).total_seconds()))
+            lines.append(f"• <code>{tx_hash[:20]}...</code> — через {sec//3600}ч {(sec%3600)//60}м")
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+
+    elif action == "stats":
+        total_pending = len(pending_checks)
+        text = (
+            f"📊 <b>Статистика</b>\n\n"
+            f"❌ Не найдено за всё время: <b>{not_found_total}</b>\n"
+            f"⏳ Сейчас в очереди: <b>{total_pending}</b>"
+        )
+        await query.edit_message_text(text, parse_mode="HTML")
+
+    elif action == "debug":
+        try:
+            spreadsheet = get_spreadsheet()
+            sheets = spreadsheet.worksheets()
+            lines = [f"📊 Листов: <b>{len(sheets)}</b>\n"]
+            for sheet in sheets:
+                rows = sheet.get_all_values()
+                lines.append(f"• <b>{sheet.title}</b> — {len(rows)} строк")
+            await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Ошибка: {e}")
+
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
@@ -229,7 +308,9 @@ async def post_init(application):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("find", find_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("recheck", recheck_command))
     app.add_handler(CommandHandler("status", status_command))
