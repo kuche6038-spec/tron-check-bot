@@ -181,7 +181,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("🔄 Перепроверить"), KeyboardButton("📊 Статистика")],
         [KeyboardButton("📋 Статус очереди"), KeyboardButton("🔍 Список листов")],
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text("✅ Панель управления активна!", reply_markup=reply_markup)
 
 
