@@ -698,29 +698,41 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка загрузки таблицы: {e}")
         return
 
+    # Множество уже виденных хешей в этом запуске — защита от дублей внутри файла
+    seen_in_run = set()
+
     for i, tx_hash in enumerate(hashes):
         if i < start_index:
             continue
         try:
-            # Ищем в уже загруженных данных — без API запросов!
-            sheet, row_index, row = find_hash_in_loaded_data(tx_hash, sheets_data)
-            if sheet and row_index:
-                status = row[13] if len(row) > 13 else ""
-                if not status:
-                    mark_as_processed(sheet, row_index)
-                    result = await verify_and_write_tron_data(sheet, row_index, tx_hash)
-                    # Добавляем в базу использованных хешей
-                    save_used_hash(spreadsheet, tx_hash, ADMIN_ID)
-                    found_count += 1
-                    logger.info(f"[{i+1}/{total}] Найден и обработан: {tx_hash[:20]}... — {result}")
-                else:
-                    # Уже обработан — всё равно добавляем в базу дублей
-                    save_used_hash(spreadsheet, tx_hash, ADMIN_ID)
-                    found_count += 1
-                    logger.info(f"[{i+1}/{total}] Уже обработан: {tx_hash[:20]}...")
-            else:
+            # Пропускаем дубли внутри самого файла hashes.txt
+            if tx_hash.lower() in seen_in_run:
+                logger.info(f"[{i+1}/{total}] Дубль внутри файла, пропускаю: {tx_hash[:20]}...")
                 not_found.append(tx_hash)
-                logger.info(f"[{i+1}/{total}] Не найден: {tx_hash[:20]}...")
+            else:
+                seen_in_run.add(tx_hash.lower())
+                sheet, row_index, row = find_hash_in_loaded_data(tx_hash, sheets_data)
+                if sheet and row_index:
+                    status = row[13] if len(row) > 13 else ""
+                    if not status:
+                        mark_as_processed(sheet, row_index)
+                        result = await verify_and_write_tron_data(sheet, row_index, tx_hash)
+                        found_count += 1
+                        logger.info(f"[{i+1}/{total}] Найден и обработан: {tx_hash[:20]}... — {result}")
+                    else:
+                        found_count += 1
+                        logger.info(f"[{i+1}/{total}] Уже обработан: {tx_hash[:20]}...")
+                    # Добавляем в used_hashes только если ещё не там
+                    if not is_duplicate_hash(tx_hash):
+                        save_used_hash(spreadsheet, tx_hash, ADMIN_ID)
+                else:
+                    # Не найден в таблице — сразу в rejected_hashes
+                    not_found.append(tx_hash)
+                    logger.info(f"[{i+1}/{total}] Не найден: {tx_hash[:20]}...")
+                    class AdminUser:
+                        username = "checkall"
+                        id = ADMIN_ID
+                    save_rejected_hash(spreadsheet, tx_hash, "не найден в таблице (/checkall)", AdminUser())
         except Exception as e:
             errors.append(tx_hash)
             logger.error(f"Ошибка при проверке {tx_hash[:20]}: {e}")
@@ -735,7 +747,7 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(progress_file, 'w') as pf:
             json.dump(progress, pf)
 
-        # Минимальная пауза — только для записи в Sheets (mark_as_processed)
+        # Минимальная пауза — только для записи в Sheets
         await asyncio.sleep(0.5)
 
         # Промежуточный отчёт каждые 100 хешей
@@ -751,24 +763,27 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(progress_file):
         os.remove(progress_file)
 
-    summary = (
-        f"✅ <b>Проверка завершена!</b>\n\n"
-        f"Всего хешей: {total}\n"
-        f"Найдено и обработано: {found_count}\n"
-        f"Не найдено в таблице: {len(not_found)}\n"
-        f"Ошибок: {len(errors)}"
-    )
-    await update.message.reply_text(summary, parse_mode="HTML")
+    try:
+        summary = (
+            f"✅ <b>Проверка завершена!</b>\n\n"
+            f"Всего хешей: {total}\n"
+            f"Найдено и обработано: {found_count}\n"
+            f"Не найдено в таблице: {len(not_found)}\n"
+            f"Ошибок: {len(errors)}"
+        )
+        await update.message.reply_text(summary, parse_mode="HTML")
 
-    # Отправляем список не найденных хешей
-    if not_found:
-        chunk_size = 50
-        for idx in range(0, len(not_found), chunk_size):
-            chunk = not_found[idx:idx + chunk_size]
-            lines = [f"❌ <b>Не найдено ({idx+1}-{idx+len(chunk)} из {len(not_found)}):</b>\n"]
-            for h in chunk:
-                lines.append(f"<code>{h}</code>")
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        # Отправляем список не найденных хешей
+        if not_found:
+            chunk_size = 50
+            for idx in range(0, len(not_found), chunk_size):
+                chunk = not_found[idx:idx + chunk_size]
+                lines = [f"❌ <b>Не найдено ({idx+1}-{idx+len(chunk)} из {len(not_found)}):</b>\n"]
+                for h in chunk:
+                    lines.append(f"<code>{h}</code>")
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка отправки финального отчёта: {e}")
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
