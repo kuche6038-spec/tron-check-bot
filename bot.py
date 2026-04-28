@@ -18,7 +18,10 @@ ADMIN_ID        = int(os.environ["ADMIN_ID"])
 SPREADSHEET_ID  = os.environ["SPREADSHEET_ID"]
 CHECK_DELAY_HOURS = 1
 TRON_API_KEY = "3a47f76f-f6aa-412c-9651-824df43c2d09"
-TRON_WALLET = "TX6z5khTbArfSSV4b2yioUxhMytyWBNjC8"
+TRON_WALLETS = [
+    "TX6z5khTbArfSSV4b2yioUxhMytyWBNjC8",
+    "TXZrknLXgXciqFK5seMiiTpH4DNwBydo9G",
+]
 
 # Колонки (считаем с 1)
 COL_DATE   = 11  # K
@@ -275,7 +278,7 @@ async def verify_and_write_tron_data(sheet, row_index: int, tx_hash: str) -> str
     sheet.update_cell(row_index, 15, amount)
 
     # Проверяем адрес и записываем результат в P
-    if to_address.lower() == TRON_WALLET.lower():
+    if any(to_address.lower() == w.lower() for w in TRON_WALLETS):
         sheet.update_cell(row_index, 16, "✅ Адрес верный")
         addr_result = "адрес верный"
     else:
