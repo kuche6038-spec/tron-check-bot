@@ -115,6 +115,67 @@ def save_rejected_hash(spreadsheet, tx_hash: str, reason: str, user: object):
         logger.error(f"Ошибка сохранения в rejected_hashes: {e}")
 
 # ========================
+# ОЧЕРЕДЬ В GOOGLE SHEETS (персистентность между рестартами)
+# ========================
+def get_pending_queue_sheet(spreadsheet):
+    """Получает или создаёт лист pending_queue"""
+    try:
+        return spreadsheet.worksheet("pending_queue")
+    except gspread.WorksheetNotFound:
+        logger.info("Создаю лист pending_queue...")
+        sheet = spreadsheet.add_worksheet(title="pending_queue", rows=1000, cols=4)
+        sheet.append_row(["hash", "user_id", "username", "check_at"])
+        return sheet
+
+def save_pending_queue(spreadsheet):
+    """Перезаписывает лист pending_queue актуальным состоянием очереди"""
+    try:
+        sheet = get_pending_queue_sheet(spreadsheet)
+        sheet.clear()
+        sheet.append_row(["hash", "user_id", "username", "check_at"])
+        for tx_hash, data in pending_checks.items():
+            user = data.get("user")
+            username = f"@{user.username}" if user and user.username else f"id:{data['user_id']}"
+            sheet.append_row([
+                tx_hash,
+                str(data["user_id"]),
+                username,
+                data["check_at"].strftime("%Y-%m-%d %H:%M:%S")
+            ])
+        logger.info(f"Очередь сохранена: {len(pending_checks)} хешей")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения очереди: {e}")
+
+def load_pending_queue(spreadsheet) -> dict:
+    """Загружает очередь из Google Sheets при старте"""
+    try:
+        sheet = get_pending_queue_sheet(spreadsheet)
+        all_rows = sheet.get_all_values()
+        queue = {}
+        now = datetime.now()
+        for row in all_rows[1:]:
+            if not row or not row[0].strip():
+                continue
+            tx_hash = row[0].strip()
+            user_id = int(row[1]) if row[1].isdigit() else 0
+            check_at_str = row[3] if len(row) > 3 else ""
+            try:
+                check_at = datetime.strptime(check_at_str, "%Y-%m-%d %H:%M:%S")
+            except:
+                check_at = now
+            queue[tx_hash] = {
+                "user_id": user_id,
+                "check_at": check_at,
+                "user": None
+            }
+        logger.info(f"Очередь восстановлена: {len(queue)} хешей")
+        return queue
+    except Exception as e:
+        logger.error(f"Ошибка загрузки очереди: {e}")
+        return {}
+
+
+# ========================
 # GOOGLE SHEETS
 # ========================
 def get_spreadsheet():
@@ -301,6 +362,7 @@ async def delayed_check_loop(application):
         await asyncio.sleep(300)
         now = datetime.now()
         to_remove = []
+        queue_changed = False
 
         for tx_hash, data in list(pending_checks.items()):
             if now < data["check_at"]:
@@ -311,33 +373,43 @@ async def delayed_check_loop(application):
                 global not_found_total
                 not_found_total += 1
                 try:
+                    # Уведомляем админа, не юзера
+                    user = data.get("user")
+                    username = f"@{user.username}" if user and user.username else f"id:{data['user_id']}"
                     await application.bot.send_message(
-                        chat_id=data["user_id"],
+                        chat_id=ADMIN_ID,
                         text=(
-                            f"⚠️ <b>Транзакция не найдена</b>\n\n"
-                            f"Хеш: <code>{tx_hash}</code>\n\n"
-                            f"Транзакция отсутствует в таблице после повторной проверки. "
-                            f"Свяжитесь с администратором."
+                            f"⚠️ <b>Хеш не найден в таблице</b>\n\n"
+                            f"Хеш: <code>{tx_hash}</code>\n"
+                            f"Юзер: {username}\n\n"
+                            f"Транзакция отсутствует после повторной проверки."
                         ),
                         parse_mode="HTML"
                     )
                     # Записываем в rejected_hashes
                     spreadsheet = get_spreadsheet()
-                    user = data.get("user")
                     if user:
                         save_rejected_hash(spreadsheet, tx_hash, "не найден в таблице", user)
                     else:
-                        # fallback если user не сохранён
                         class FakeUser:
                             username = None
                             id = data["user_id"]
                         save_rejected_hash(spreadsheet, tx_hash, "не найден в таблице", FakeUser())
                 except Exception as e:
-                    logger.error(f"Не удалось отправить личку {data['user_id']}: {e}")
+                    logger.error(f"Ошибка уведомления админа: {e}")
             to_remove.append(tx_hash)
+            queue_changed = True
 
         for tx_hash in to_remove:
             pending_checks.pop(tx_hash, None)
+
+        # Сохраняем очередь в Sheets если были изменения
+        if queue_changed:
+            try:
+                spreadsheet = get_spreadsheet()
+                save_pending_queue(spreadsheet)
+            except Exception as e:
+                logger.error(f"Ошибка сохранения очереди: {e}")
 
 # ========================
 # ОБРАБОТЧИК СООБЩЕНИЙ
@@ -394,6 +466,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "check_at": datetime.now() + timedelta(hours=CHECK_DELAY_HOURS),
             "user": user
         }
+        # Сохраняем очередь в Sheets чтобы пережить рестарт
+        try:
+            spreadsheet = get_spreadsheet()
+            save_pending_queue(spreadsheet)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения очереди: {e}")
 
 # ========================
 # КОМАНДЫ АДМИНА
@@ -750,15 +828,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # ========================
 async def post_init(application):
-    # Загружаем базу использованных хешей при старте
-    global used_hashes_cache
+    global used_hashes_cache, pending_checks
     try:
         spreadsheet = get_spreadsheet()
+        # Загружаем базу использованных хешей
         used_hashes_cache = load_used_hashes(spreadsheet)
         logger.info(f"База хешей загружена: {len(used_hashes_cache)} записей")
+        # Восстанавливаем очередь после рестарта
+        pending_checks = load_pending_queue(spreadsheet)
+        if pending_checks:
+            logger.info(f"Очередь восстановлена: {len(pending_checks)} хешей")
     except Exception as e:
-        logger.error(f"Не удалось загрузить базу хешей: {e}")
+        logger.error(f"Ошибка инициализации: {e}")
         used_hashes_cache = set()
+        pending_checks = {}
 
     asyncio.create_task(delayed_check_loop(application))
 
