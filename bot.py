@@ -122,12 +122,14 @@ async def sheets_write_with_retry(func, *args, max_attempts: int = 5, **kwargs):
 def load_used_hashes(spreadsheet) -> set:
     sheet = get_or_create_sheet(spreadsheet, "_использованные_хеши", cols=3)
     all_rows = sheet.get_all_values()
-    if not all_rows or all_rows[0] != ["хеш", "user_id", "дата_время"]:
-        sheet.clear()
+    if not all_rows:
+        # Лист пустой — добавляем заголовок
         sheet.append_row(["хеш", "user_id", "дата_время"])
         return set()
     hashes = set()
-    for row in all_rows[1:]:
+    # Пропускаем первую строку если это заголовок (любой вариант)
+    start = 1 if all_rows[0] and not re.match(r"[0-9a-fA-F]{32,}", all_rows[0][0]) else 0
+    for row in all_rows[start:]:
         if row and row[0].strip():
             hashes.add(row[0].strip().lower())
     logger.info(f"Загружено {len(hashes)} использованных хешей")
