@@ -14,7 +14,8 @@ from google.oauth2.service_account import Credentials
 # НАСТРОЙКИ
 # ========================
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-ADMIN_ID          = int(os.environ["ADMIN_ID"])
+ADMIN_ID          = int(os.environ["ADMIN_ID"])  # главный админ (для обратной совместимости)
+ADMIN_IDS         = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", os.environ["ADMIN_ID"]).split(",")]
 SPREADSHEET_ID    = os.environ["SPREADSHEET_ID"]
 TRON_API_KEY      = os.environ.get("TRON_API_KEY", "3a47f76f-f6aa-412c-9651-824df43c2d09")
 CHECK_DELAY_HOURS = 1
@@ -55,6 +56,17 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ========================
+# РАССЫЛКА АДМИНАМ
+# ========================
+async def notify_admins(bot, text: str, parse_mode: str = "HTML"):
+    """Отправляет сообщение всем админам в личку."""
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=text, parse_mode=parse_mode)
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение админу {admin_id}: {e}")
 
 # ========================
 # ГЛОБАЛЬНОЕ СОСТОЯНИЕ
@@ -502,15 +514,12 @@ async def delayed_check_loop(application):
                 try:
                     user = data.get("user")
                     username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
-                    await application.bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=(
-                            f"⚠️ <b>Хеш не найден в таблице</b>\n\n"
-                            f"Хеш: <code>{tx_hash}</code>\n"
-                            f"Юзер: {username}\n\n"
-                            f"Транзакция отсутствует после повторной проверки."
-                        ),
-                        parse_mode="HTML"
+                    await notify_admins(
+                        application.bot,
+                        f"⚠️ <b>Хеш не найден в таблице</b>\n\n"
+                        f"Хеш: <code>{tx_hash}</code>\n"
+                        f"Юзер: {username}\n\n"
+                        f"Транзакция отсутствует после повторной проверки."
                     )
                     spreadsheet = get_spreadsheet()
                     if user:
@@ -560,12 +569,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_duplicate_hash(tx_hash):
         logger.warning(f"Дубль от {user_id}: {tx_hash[:20]}")
         try:
-            await update.message.reply_text(
-                f"⛔ <b>Этот хеш уже был использован ранее!</b>\n\n"
-                f"Хеш: <code>{tx_hash}</code>\n\n"
-                f"Повторное использование транзакции невозможно. "
-                f"Свяжитесь с администратором.",
-                parse_mode="HTML"
+            username = f"@{user.username}" if user.username else f"id:{user_id}"
+            # Уведомляем всех админов в личку
+            await notify_admins(
+                context.bot,
+                f"⛔ <b>Попытка использовать дубль хеша</b>\n\n"
+                f"Хеш: <code>{tx_hash}</code>\n"
+                f"Юзер: {username}\n\n"
+                f"Транзакция уже была использована ранее."
             )
             spreadsheet = get_spreadsheet()
             await save_duplicate(spreadsheet, tx_hash, user)
@@ -613,7 +624,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # КОМАНДЫ АДМИНА
 # ========================
 async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
     if not pending_checks:
         await update.message.reply_text("📋 Очередь пуста.")
@@ -648,7 +659,7 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
     keyboard = [
         [KeyboardButton("🔄 Перепроверить"), KeyboardButton("📊 Статистика")],
@@ -660,7 +671,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
     text = update.message.text
 
@@ -724,7 +735,7 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
     keyboard = [
         [InlineKeyboardButton("🔄 Перепроверить очередь", callback_data="recheck")],
@@ -741,7 +752,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID:
+    if query.from_user.id not in ADMIN_IDS:
         await query.answer("Нет доступа")
         return
     await query.answer()
@@ -810,7 +821,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /checkall — с адаптивной паузой
 # ========================
 async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
 
     spreadsheet = get_spreadsheet()
@@ -966,7 +977,7 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка отправки финального отчёта: {e}")
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
     args = context.args
     if not args:
@@ -992,7 +1003,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
     try:
         spreadsheet = get_spreadsheet()
@@ -1007,7 +1018,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
+    if update.message.from_user.id not in ADMIN_IDS:
         return
     if not pending_checks:
         await update.message.reply_text("📋 Очередь пуста.")
