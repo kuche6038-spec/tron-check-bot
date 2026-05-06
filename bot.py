@@ -864,11 +864,25 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if tx_hash.lower() in seen_in_run:
                 duplicates.append(tx_hash)
                 logger.info(f"[{i+1}/{total}] Дубль в файле: {tx_hash[:20]}")
+                try:
+                    class AdminUser:
+                        username = "checkall"
+                        id = ADMIN_ID
+                    await save_duplicate(spreadsheet, tx_hash, AdminUser())
+                except Exception as e:
+                    logger.error(f"Ошибка записи дубля: {e}")
 
             elif is_duplicate_hash(tx_hash):
                 duplicates.append(tx_hash)
                 found_count += 1
                 logger.info(f"[{i+1}/{total}] Уже в использованных: {tx_hash[:20]}")
+                try:
+                    class AdminUser:
+                        username = "checkall"
+                        id = ADMIN_ID
+                    await save_duplicate(spreadsheet, tx_hash, AdminUser())
+                except Exception as e:
+                    logger.error(f"Ошибка записи дубля: {e}")
 
             else:
                 seen_in_run.add(tx_hash.lower())
