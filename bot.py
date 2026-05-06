@@ -132,14 +132,13 @@ async def sheets_write_with_retry(func, *args, max_attempts: int = 5, **kwargs):
 # Структура: хеш | user_id | дата_время
 # ========================
 def load_used_hashes(spreadsheet) -> set:
-    sheet = get_or_create_sheet(spreadsheet, "_использованные_хеши", cols=3)
+    sheet = get_or_create_sheet(spreadsheet, "_использованные_хеши", cols=5)
     all_rows = sheet.get_all_values()
     if not all_rows:
-        # Лист пустой — добавляем заголовок
-        sheet.append_row(["хеш", "user_id", "дата_время"])
+        sheet.append_row(["хеш", "user_id", "ник", "сумма", "дата_время"])
         return set()
     hashes = set()
-    # Пропускаем первую строку если это заголовок (любой вариант)
+    # Пропускаем первую строку если это заголовок
     start = 1 if all_rows[0] and not re.match(r"[0-9a-fA-F]{32,}", all_rows[0][0]) else 0
     for row in all_rows[start:]:
         if row and row[0].strip():
@@ -147,14 +146,20 @@ def load_used_hashes(spreadsheet) -> set:
     logger.info(f"Загружено {len(hashes)} использованных хешей")
     return hashes
 
-async def save_used_hash(spreadsheet, tx_hash: str, user_id: int):
+async def save_used_hash(spreadsheet, tx_hash: str, user_id: int, username: str = "", amount: str = ""):
     if tx_hash.lower() in used_hashes_cache:
         return
     try:
-        sheet = get_or_create_sheet(spreadsheet, "_использованные_хеши", cols=3)
+        sheet = get_or_create_sheet(spreadsheet, "_использованные_хеши", cols=5)
         await sheets_write_with_retry(
             sheet.append_row,
-            [tx_hash.lower(), str(user_id), datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+            [
+                tx_hash.lower(),
+                str(user_id),
+                username,
+                amount,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ]
         )
         used_hashes_cache.add(tx_hash.lower())
     except Exception as e:
@@ -425,21 +430,24 @@ async def get_tron_transaction(tx_hash: str) -> dict:
         logger.error(f"Ошибка TRON API: {e}")
     return {}
 
-async def verify_and_write_tron_data(sheet, row_index: int, tx_hash: str) -> str:
-    """Проверяет транзакцию и записывает результат ОДНИМ batch запросом."""
+async def verify_and_write_tron_data(sheet, row_index: int, tx_hash: str) -> tuple[str, str]:
+    """
+    Проверяет транзакцию и записывает результат ОДНИМ batch запросом.
+    Возвращает (result_str, amount).
+    """
     data = await get_tron_transaction(tx_hash)
 
     if not data:
         await mark_and_write_batch(sheet, row_index, "✅ обработано", "⚠️ API недоступен", "—")
-        return "API недоступен"
+        return "API недоступен", ""
 
     if data.get("contractRet") == "FAILED":
         await mark_and_write_batch(sheet, row_index, "✅ обработано", "⚠️ транзакция FAILED", "—")
-        return "транзакция FAILED"
+        return "транзакция FAILED", ""
 
     if not data.get("trc20TransferInfo") and not data.get("contractData"):
         await mark_and_write_batch(sheet, row_index, "✅ обработано", "⚠️ нет данных", "—")
-        return "нет данных транзакции"
+        return "нет данных транзакции", ""
 
     amount = ""
     to_address = ""
@@ -469,22 +477,23 @@ async def verify_and_write_tron_data(sheet, row_index: int, tx_hash: str) -> str
         addr_result = f"❌ Адрес неверный: {to_address}"
 
     await mark_and_write_batch(sheet, row_index, "✅ обработано", amount, addr_result)
-    return f"сумма: {amount}, {addr_result}"
+    return f"сумма: {amount}, {addr_result}", amount
 
 # ========================
 # ОСНОВНАЯ ЛОГИКА ПРОВЕРКИ
 # ========================
-async def check_hash_with_tron(tx_hash: str) -> bool:
+async def check_hash_with_tron(tx_hash: str) -> tuple[bool, str]:
+    """Возвращает (найден, сумма)."""
     try:
         sheet, row_index, _ = await find_hash_in_all_sheets(tx_hash)
         if sheet and row_index:
-            result = await verify_and_write_tron_data(sheet, row_index, tx_hash)
+            result, amount = await verify_and_write_tron_data(sheet, row_index, tx_hash)
             logger.info(f"TRON проверка {tx_hash[:20]}: {result}")
-            return True
-        return False
+            return True, amount
+        return False, ""
     except Exception as e:
         logger.error(f"Ошибка проверки хеша {tx_hash[:20]}: {e}")
-        return False
+        return False, ""
 
 # ========================
 # ФОНОВЫЙ ЦИКЛ
@@ -500,12 +509,14 @@ async def delayed_check_loop(application):
             if now < data["check_at"]:
                 continue
             logger.info(f"Отложенная проверка: {tx_hash[:20]}")
-            found = await check_hash_with_tron(tx_hash)
+            found, amount = await check_hash_with_tron(tx_hash)
 
             if found:
                 try:
                     spreadsheet = get_spreadsheet()
-                    await save_used_hash(spreadsheet, tx_hash, data["user_id"])
+                    user = data.get("user")
+                    username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
+                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
                 except Exception as e:
                     logger.error(f"Ошибка сохранения в использованные_хеши: {e}")
             else:
@@ -598,11 +609,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     processing_hashes.add(tx_hash.lower())
     try:
-        found = await check_hash_with_tron(tx_hash)
+        found, amount = await check_hash_with_tron(tx_hash)
         if found:
             try:
                 spreadsheet = get_spreadsheet()
-                await save_used_hash(spreadsheet, tx_hash, user_id)
+                username = f"@{user.username}" if user.username else f"id:{user_id}"
+                await save_used_hash(spreadsheet, tx_hash, user_id, username, amount)
             except Exception as e:
                 logger.error(f"Ошибка сохранения в использованные_хеши: {e}")
         else:
@@ -634,13 +646,16 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_count, not_found_list = 0, []
 
     for tx_hash, data in list(pending_checks.items()):
-        if await check_hash_with_tron(tx_hash):
+        found, amount = await check_hash_with_tron(tx_hash)
+        if found:
             found_count += 1
             pending_checks.pop(tx_hash, None)
             processing_hashes.discard(tx_hash.lower())
             try:
                 spreadsheet = get_spreadsheet()
-                await save_used_hash(spreadsheet, tx_hash, data["user_id"])
+                user = data.get("user")
+                username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
+                await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
             except Exception as e:
                 logger.error(f"Ошибка сохранения при recheck: {e}")
         else:
@@ -688,7 +703,9 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 processing_hashes.discard(tx_hash.lower())
                 try:
                     spreadsheet = get_spreadsheet()
-                    await save_used_hash(spreadsheet, tx_hash, data["user_id"])
+                    user = data.get("user")
+                    username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
+                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, "")
                 except Exception as e:
                     logger.error(f"Ошибка сохранения при recheck: {e}")
             else:
@@ -771,7 +788,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 processing_hashes.discard(tx_hash.lower())
                 try:
                     spreadsheet = get_spreadsheet()
-                    await save_used_hash(spreadsheet, tx_hash, data["user_id"])
+                    user = data.get("user")
+                    username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
+                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, "")
                 except Exception as e:
                     logger.error(f"Ошибка сохранения при recheck: {e}")
             else:
@@ -902,13 +921,14 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sheet, row_index, row = find_hash_in_loaded_data(tx_hash, sheets_data)
                 if sheet and row_index:
                     status = row[13] if len(row) > 13 else ""
+                    hash_amount = ""
                     if not status:
-                        result = await verify_and_write_tron_data(sheet, row_index, tx_hash)
+                        result, hash_amount = await verify_and_write_tron_data(sheet, row_index, tx_hash)
                         logger.info(f"[{i+1}/{total}] Обработан: {tx_hash[:20]} — {result}")
                     else:
                         logger.info(f"[{i+1}/{total}] Уже обработан: {tx_hash[:20]}")
                     found_count += 1
-                    await save_used_hash(spreadsheet, tx_hash, ADMIN_ID)
+                    await save_used_hash(spreadsheet, tx_hash, ADMIN_ID, "@checkall", hash_amount)
                 else:
                     not_found.append(tx_hash)
                     logger.info(f"[{i+1}/{total}] Не найден: {tx_hash[:20]}")
