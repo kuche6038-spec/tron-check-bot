@@ -23,6 +23,8 @@ CHECK_DELAY_HOURS = 1
 TRON_WALLETS = [
     "TX6z5khTbArfSSV4b2yioUxhMytyWBNjC8",
     "TXZrknLXgXciqFK5seMiiTpH4DNwBydo9G",
+    "TGfJMbySkZQKc68Rc6cHWZ7ohCEVbeyY41",
+    "TN43HtnfYDxdj4b9ML4gin4S2816yJQArA",
 ]
 
 GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDENTIALS"])
