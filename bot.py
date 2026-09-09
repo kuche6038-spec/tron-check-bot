@@ -4,6 +4,7 @@ import re
 import os
 import json
 import aiohttp
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -29,11 +30,127 @@ TRON_WALLETS = [
 
 GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 
-# Колонки в основных листах (считаем с 1)
-COL_HASH   = 13  # M
-COL_STATUS = 14  # N
-COL_AMOUNT = 15  # O
-COL_ADDR   = 16  # P
+# ========================
+# ПРИВЯЗКА К КОЛОНКАМ ПО ЗАГОЛОВКУ
+# Номера колонок в коде не фиксируются: бот читает строку 1 листа,
+# находит заголовок с "хеш"/"хэш" и отсчитывает от него свои четыре колонки.
+# ========================
+SHEET_MARKER     = "реестр"           # обрабатываются только листы с этим словом в названии
+AMOUNT_TOLERANCE = Decimal("0.01")    # допустимое расхождение сумм, USDT
+
+# Заголовки бота — четыре колонки сразу за колонкой хеша
+BOT_HEADERS = ["статус бота", "сумма в сети", "проверка адреса", "сверка суммы"]
+
+
+def col_letter(idx: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA."""
+    letters, n = "", idx + 1
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(ord("A") + rem) + letters
+    return letters
+
+
+def _norm(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def is_register_sheet(title: str) -> bool:
+    t = title or ""
+    return not t.startswith("_") and SHEET_MARKER in t.lower()
+
+
+def parse_amount(value):
+    """'17826,7' -> Decimal('17826.7'). Пусто или мусор -> None."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    cleaned = re.sub(r"[^0-9,.\-]", "", raw).replace(",", ".")
+    if cleaned.count(".") > 1:                      # разделители тысяч: 1.234.56
+        head, _, tail = cleaned.rpartition(".")
+        cleaned = head.replace(".", "") + "." + tail
+    try:
+        return Decimal(cleaned)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def format_amount(value) -> str:
+    """Наружу число уходит с десятичной ЗАПЯТОЙ — таблица в русской локали."""
+    if value is None:
+        return ""
+    try:
+        return format(value.normalize(), "f").replace(".", ",")
+    except (InvalidOperation, ValueError):
+        return str(value)
+
+
+def safe_cell(value: str) -> str:
+    """
+    Ячейки пишутся с value_input_option=USER_ENTERED, чтобы число стало числом.
+    Побочный эффект: строка, начинающаяся с = + - @, была бы понята как формула.
+    Такую строку экранируем апострофом.
+    """
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+
+def bind_columns(rows: list):
+    """
+    Ищет в строке 1 колонку хеша и проверяет, что четыре колонки справа
+    свободны или уже принадлежат боту.
+    Возвращает (привязка, причина_отказа). Привязка None -> лист не трогаем.
+    """
+    if not rows:
+        return None, "лист пуст"
+    header = rows[0]
+
+    idx_hash = None
+    for i, cell in enumerate(header):
+        c = _norm(cell)
+        if "хеш" in c or "хэш" in c:
+            idx_hash = i
+            break
+    if idx_hash is None:
+        return None, "в строке 1 нет заголовка с 'хеш'"
+
+    # заявленная оператором сумма — ближайший слева заголовок со словом 'сумма'
+    idx_declared = None
+    for i in range(idx_hash - 1, -1, -1):
+        if "сумма" in _norm(header[i]):
+            idx_declared = i
+            break
+
+    targets = [idx_hash + 1 + k for k in range(len(BOT_HEADERS))]
+    for k, t in enumerate(targets):
+        current = _norm(header[t]) if t < len(header) else ""
+        if current and current != BOT_HEADERS[k]:
+            return None, (f"колонка {col_letter(t)} занята чужим заголовком "
+                          f"'{header[t]}'")
+
+    headers_present = all(
+        t < len(header) and _norm(header[t]) == BOT_HEADERS[k]
+        for k, t in enumerate(targets)
+    )
+    return {
+        "hash":            idx_hash,
+        "declared":        idx_declared,
+        "status":          targets[0],
+        "amount":          targets[1],
+        "addr":            targets[2],
+        "recon":           targets[3],
+        "headers_present": headers_present,
+    }, ""
+
+
+async def ensure_bot_headers(sheet, binding: dict):
+    """Проставляет заголовки бота в строку 1, если их там ещё нет."""
+    if binding.get("headers_present"):
+        return
+    rng = f"{col_letter(binding['status'])}1:{col_letter(binding['recon'])}1"
+    await sheets_write_with_retry(sheet.update, range_name=rng, values=[BOT_HEADERS])
+    binding["headers_present"] = True
+    logger.info(f"Заголовки бота проставлены в {rng}")
 
 # Служебные листы (префикс _ означает технический лист)
 SYSTEM_SHEETS = {
@@ -78,6 +195,7 @@ pending_checks: dict   = {}
 processing_hashes: set = set()
 not_found_total: int   = 0
 _spreadsheet_cache     = None
+skipped_sheets: dict   = {}   # лист -> причина, по которой бот его не трогает
 
 # ========================
 # GOOGLE SHEETS — СОЕДИНЕНИЕ
@@ -340,13 +458,13 @@ def clear_checkall_progress(spreadsheet):
 # ========================
 async def load_all_sheets_data(spreadsheet) -> dict:
     result = {}
-    sheets = [s for s in spreadsheet.worksheets() if s.title not in SYSTEM_SHEETS]
+    sheets = [s for s in spreadsheet.worksheets() if is_register_sheet(s.title)]
     for sheet in sheets:
         logger.info(f"Загружаю лист: '{sheet.title}'")
+        rows = None
         for attempt in range(3):
             try:
                 rows = await asyncio.get_event_loop().run_in_executor(None, sheet.get_all_values)
-                result[sheet.title] = {"sheet": sheet, "rows": rows}
                 break
             except Exception as e:
                 if "429" in str(e) or "RATE_LIMIT" in str(e) or "Quota" in str(e):
@@ -356,22 +474,39 @@ async def load_all_sheets_data(spreadsheet) -> dict:
                 else:
                     logger.error(f"Ошибка загрузки листа '{sheet.title}': {e}")
                     break
+        if rows is None:
+            await asyncio.sleep(1)
+            continue
+        binding, reason = bind_columns(rows)
+        if binding is None:
+            skipped_sheets[sheet.title] = reason
+            logger.warning(f"Лист '{sheet.title}' пропущен: {reason}")
+        else:
+            skipped_sheets.pop(sheet.title, None)
+            result[sheet.title] = {"sheet": sheet, "rows": rows, "binding": binding}
         await asyncio.sleep(1)
-    logger.info(f"Загружено листов: {len(result)}")
+    logger.info(f"Загружено листов: {len(result)}, пропущено: {len(skipped_sheets)}")
     return result
 
 def find_hash_in_loaded_data(tx_hash: str, sheets_data: dict):
+    target = tx_hash.lower()
     for title, data in sheets_data.items():
+        binding = data["binding"]
+        col = binding["hash"]
         for i, row in enumerate(data["rows"]):
-            if len(row) > 12 and row[12].strip().lower() == tx_hash.lower():
+            if i == 0:
+                continue                      # строка заголовков
+            if len(row) > col and row[col].strip().lower() == target:
                 logger.info(f"Найден на листе '{title}', строка {i + 1}")
-                return data["sheet"], i + 1, row
-    return None, None, None
+                return data["sheet"], i + 1, row, binding
+    return None, None, None, None
 
 async def find_hash_in_all_sheets(tx_hash: str):
     spreadsheet = get_spreadsheet()
-    sheets = [s for s in spreadsheet.worksheets() if s.title not in SYSTEM_SHEETS]
+    target = tx_hash.lower()
+    sheets = [s for s in spreadsheet.worksheets() if is_register_sheet(s.title)]
     for sheet in sheets:
+        all_rows = None
         for attempt in range(3):
             try:
                 all_rows = await asyncio.get_event_loop().run_in_executor(None, sheet.get_all_values)
@@ -383,28 +518,50 @@ async def find_hash_in_all_sheets(tx_hash: str):
                     await asyncio.sleep(wait)
                 else:
                     raise
-        else:
+        if all_rows is None:
             continue
+        binding, reason = bind_columns(all_rows)
+        if binding is None:
+            skipped_sheets[sheet.title] = reason
+            logger.warning(f"Лист '{sheet.title}' пропущен: {reason}")
+            continue
+        skipped_sheets.pop(sheet.title, None)
+        col = binding["hash"]
         for i, row in enumerate(all_rows):
-            if len(row) > 12 and row[12].strip().lower() == tx_hash.lower():
+            if i == 0:
+                continue
+            if len(row) > col and row[col].strip().lower() == target:
                 logger.info(f"Найден на листе '{sheet.title}', строка {i + 1}")
-                return sheet, i + 1, row
-    return None, None, None
+                return sheet, i + 1, row, binding
+    return None, None, None, None
 
 # ========================
 # BATCH ЗАПИСЬ В ОСНОВНУЮ ТАБЛИЦУ
 # ========================
-async def mark_and_write_batch(sheet, row_index: int, status: str, amount: str, addr_result: str):
+async def mark_and_write_batch(sheet, binding: dict, row_index: int,
+                               status: str, amount: str, addr_result: str, recon: str):
     """
-    Записывает статус, сумму и адрес ОДНИМ batch запросом вместо 3 отдельных.
+    Записывает статус, сумму, адрес и сверку ОДНИМ batch запросом.
+    Колонки берутся из привязки, а не из констант.
     """
     try:
+        await ensure_bot_headers(sheet, binding)
         updates = [
-            {"range": f"N{row_index}", "values": [[status]]},
-            {"range": f"O{row_index}", "values": [[amount]]},
-            {"range": f"P{row_index}", "values": [[addr_result]]},
+            {"range": f"{col_letter(binding['status'])}{row_index}", "values": [[safe_cell(status)]]},
+            {"range": f"{col_letter(binding['amount'])}{row_index}", "values": [[safe_cell(amount)]]},
+            {"range": f"{col_letter(binding['addr'])}{row_index}",   "values": [[safe_cell(addr_result)]]},
+            {"range": f"{col_letter(binding['recon'])}{row_index}",  "values": [[safe_cell(recon)]]},
         ]
-        await sheets_write_with_retry(sheet.batch_update, updates)
+        # USER_ENTERED: без него Google Sheets положит "8018,5" как ТЕКСТ,
+        # и колонка перестанет суммироваться
+        result = await sheets_write_with_retry(
+            sheet.batch_update, updates, value_input_option="USER_ENTERED"
+        )
+        if result is None:
+            # sheets_write_with_retry исчерпал попытки и вернул None:
+            # без этой проверки строка молча осталась бы незаписанной
+            raise RuntimeError(f"запись строки {row_index} не подтверждена Google Sheets")
+        return result
     except Exception as e:
         logger.error(f"Ошибка batch записи строки {row_index}: {e}")
         raise
@@ -432,70 +589,110 @@ async def get_tron_transaction(tx_hash: str) -> dict:
         logger.error(f"Ошибка TRON API: {e}")
     return {}
 
-async def verify_and_write_tron_data(sheet, row_index: int, tx_hash: str) -> tuple[str, str]:
+async def verify_and_write_tron_data(sheet, binding: dict, row_index: int,
+                                     tx_hash: str, row: list = None) -> tuple[str, str, str]:
     """
     Проверяет транзакцию и записывает результат ОДНИМ batch запросом.
-    Возвращает (result_str, amount).
+    Возвращает (result_str, amount, recon).
     """
     data = await get_tron_transaction(tx_hash)
 
     if not data:
-        await mark_and_write_batch(sheet, row_index, "✅ обработано", "⚠️ API недоступен", "—")
-        return "API недоступен", ""
+        await mark_and_write_batch(sheet, binding, row_index,
+                                   "✅ обработано", "⚠️ API недоступен", "—", "—")
+        return "API недоступен", "", "—"
 
     if data.get("contractRet") == "FAILED":
-        await mark_and_write_batch(sheet, row_index, "✅ обработано", "⚠️ транзакция FAILED", "—")
-        return "транзакция FAILED", ""
+        await mark_and_write_batch(sheet, binding, row_index,
+                                   "✅ обработано", "⚠️ транзакция FAILED", "—", "—")
+        return "транзакция FAILED", "", "—"
 
     if not data.get("trc20TransferInfo") and not data.get("contractData"):
-        await mark_and_write_batch(sheet, row_index, "✅ обработано", "⚠️ нет данных", "—")
-        return "нет данных транзакции", ""
+        await mark_and_write_batch(sheet, binding, row_index,
+                                   "✅ обработано", "⚠️ нет данных", "—", "—")
+        return "нет данных транзакции", "", "—"
 
-    amount = ""
+    amount_dec = None
     to_address = ""
 
     trc20_transfers = data.get("trc20TransferInfo", [])
     if trc20_transfers:
         transfer = trc20_transfers[0]
         raw_amount = transfer.get("amount_str", transfer.get("amount", "0"))
-        decimals = int(transfer.get("decimals", 6))
         try:
-            amount = str(round(int(raw_amount) / (10 ** decimals), 2))
-        except Exception:
-            amount = str(raw_amount)
-        to_address = transfer.get("to_address", "")
+            decimals = int(transfer.get("decimals", 6))
+        except (TypeError, ValueError):
+            decimals = 6
+        try:
+            amount_dec = Decimal(str(raw_amount)) / (Decimal(10) ** decimals)
+        except (InvalidOperation, ValueError):
+            amount_dec = None
+        to_address = transfer.get("to_address", "") or ""
     else:
         raw_amount = data.get("amount", 0)
         try:
-            amount = str(round(int(raw_amount) / 1_000_000, 2))
-        except Exception:
-            amount = str(raw_amount)
-        contract_data = data.get("contractData", {})
-        to_address = contract_data.get("to_address", "")
+            amount_dec = Decimal(str(raw_amount)) / Decimal(1_000_000)
+        except (InvalidOperation, ValueError):
+            amount_dec = None
+        contract_data = data.get("contractData") or {}
+        to_address = contract_data.get("to_address", "") or ""
+
+    amount = format_amount(amount_dec) if amount_dec is not None else str(raw_amount)
 
     if any(to_address.lower() == w.lower() for w in TRON_WALLETS):
         addr_result = "✅ Адрес верный"
     else:
         addr_result = f"❌ Адрес неверный: {to_address}"
 
-    await mark_and_write_batch(sheet, row_index, "✅ обработано", amount, addr_result)
-    return f"сумма: {amount}, {addr_result}", amount
+    # сверка суммы: что заявил оператор против того, что в блокчейне
+    declared = None
+    if row is not None and binding.get("declared") is not None:
+        di = binding["declared"]
+        if di < len(row):
+            declared = parse_amount(row[di])
+
+    if amount_dec is None or declared is None:
+        recon = "—"
+    elif abs(declared - amount_dec) <= AMOUNT_TOLERANCE:
+        recon = "✅ сумма сходится"
+    else:
+        recon = (f"⚠️ заявлено {format_amount(declared)}, "
+                 f"в сети {format_amount(amount_dec)}")
+
+    await mark_and_write_batch(sheet, binding, row_index,
+                               "✅ обработано", amount, addr_result, recon)
+    return f"сумма: {amount}, {addr_result}, {recon}", amount, recon
 
 # ========================
 # ОСНОВНАЯ ЛОГИКА ПРОВЕРКИ
 # ========================
-async def check_hash_with_tron(tx_hash: str) -> tuple[bool, str]:
-    """Возвращает (найден, сумма)."""
+async def check_hash_with_tron(tx_hash: str) -> tuple[bool, str, str]:
+    """Возвращает (найден, сумма, сверка)."""
     try:
-        sheet, row_index, _ = await find_hash_in_all_sheets(tx_hash)
+        sheet, row_index, row, binding = await find_hash_in_all_sheets(tx_hash)
         if sheet and row_index:
-            result, amount = await verify_and_write_tron_data(sheet, row_index, tx_hash)
+            result, amount, recon = await verify_and_write_tron_data(
+                sheet, binding, row_index, tx_hash, row
+            )
             logger.info(f"TRON проверка {tx_hash[:20]}: {result}")
-            return True, amount
-        return False, ""
+            return True, amount, recon
+        return False, "", ""
     except Exception as e:
         logger.error(f"Ошибка проверки хеша {tx_hash[:20]}: {e}")
-        return False, ""
+        return False, "", ""
+
+
+async def notify_amount_mismatch(bot, tx_hash: str, recon: str, who: str):
+    """Расхождение заявленной и фактической суммы — сигнал админам."""
+    if not recon or not recon.startswith("⚠️"):
+        return
+    await notify_admins(
+        bot,
+        f"⚠️ <b>Расхождение суммы</b>\n\n"
+        f"Хеш: <code>{tx_hash}</code>\n"
+        f"{recon}\n"
+        f"Юзер: {who}"
+    )
 
 # ========================
 # ФОНОВЫЙ ЦИКЛ
@@ -511,7 +708,7 @@ async def delayed_check_loop(application):
             if now < data["check_at"]:
                 continue
             logger.info(f"Отложенная проверка: {tx_hash[:20]}")
-            found, amount = await check_hash_with_tron(tx_hash)
+            found, amount, recon = await check_hash_with_tron(tx_hash)
 
             if found:
                 try:
@@ -519,6 +716,7 @@ async def delayed_check_loop(application):
                     user = data.get("user")
                     username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
                     await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
+                    await notify_amount_mismatch(application.bot, tx_hash, recon, username)
                 except Exception as e:
                     logger.error(f"Ошибка сохранения в использованные_хеши: {e}")
             else:
@@ -558,6 +756,42 @@ async def delayed_check_loop(application):
                 await save_pending_queue(spreadsheet)
             except Exception as e:
                 logger.error(f"Ошибка сохранения очереди: {e}")
+
+# ========================
+# ДИАГНОСТИКА ЛИСТОВ
+# ========================
+async def build_sheets_report(spreadsheet) -> str:
+    """Что бот видит, куда привязался, что пропускает и почему."""
+    sheets = spreadsheet.worksheets()
+    lines = [f"📊 Листов всего: <b>{len(sheets)}</b>\n"]
+    for sheet in sheets:
+        rows = await asyncio.get_event_loop().run_in_executor(None, sheet.get_all_values)
+        title = sheet.title
+        if title.startswith("_") or title in SYSTEM_SHEETS:
+            lines.append(f"• <b>{title}</b> ⚙️ служебный — {len(rows)} строк")
+            continue
+        if not is_register_sheet(title):
+            lines.append(f"• <b>{title}</b> — не реестр, пропускается")
+            continue
+        binding, reason = bind_columns(rows)
+        if binding is None:
+            lines.append(f"• <b>{title}</b> ⛔ {reason}")
+            skipped_sheets[title] = reason
+        else:
+            skipped_sheets.pop(title, None)
+            declared = (col_letter(binding["declared"])
+                        if binding["declared"] is not None else "нет")
+            lines.append(
+                f"• <b>{title}</b> — {len(rows)} строк · "
+                f"хеш {col_letter(binding['hash'])} · "
+                f"пишу в {col_letter(binding['status'])}–{col_letter(binding['recon'])} · "
+                f"заявленная сумма {declared}"
+            )
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…список обрезан"
+    return text
+
 
 # ========================
 # ОБРАБОТЧИК СООБЩЕНИЙ
@@ -611,12 +845,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     processing_hashes.add(tx_hash.lower())
     try:
-        found, amount = await check_hash_with_tron(tx_hash)
+        found, amount, recon = await check_hash_with_tron(tx_hash)
         if found:
             try:
                 spreadsheet = get_spreadsheet()
                 username = f"@{user.username}" if user.username else f"id:{user_id}"
                 await save_used_hash(spreadsheet, tx_hash, user_id, username, amount)
+                await notify_amount_mismatch(context.bot, tx_hash, recon, username)
             except Exception as e:
                 logger.error(f"Ошибка сохранения в использованные_хеши: {e}")
         else:
@@ -648,7 +883,7 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_count, not_found_list = 0, []
 
     for tx_hash, data in list(pending_checks.items()):
-        found, amount = await check_hash_with_tron(tx_hash)
+        found, amount, recon = await check_hash_with_tron(tx_hash)
         if found:
             found_count += 1
             pending_checks.pop(tx_hash, None)
@@ -658,6 +893,7 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user = data.get("user")
                 username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
                 await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
+                await notify_amount_mismatch(context.bot, tx_hash, recon, username)
             except Exception as e:
                 logger.error(f"Ошибка сохранения при recheck: {e}")
         else:
@@ -699,7 +935,8 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔄 Проверяю {len(pending_checks)} хешей...")
         found_count, not_found_list = 0, []
         for tx_hash, data in list(pending_checks.items()):
-            if await check_hash_with_tron(tx_hash):
+            found, amount, recon = await check_hash_with_tron(tx_hash)
+            if found:
                 found_count += 1
                 pending_checks.pop(tx_hash, None)
                 processing_hashes.discard(tx_hash.lower())
@@ -707,7 +944,8 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     spreadsheet = get_spreadsheet()
                     user = data.get("user")
                     username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
-                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, "")
+                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
+                    await notify_amount_mismatch(context.bot, tx_hash, recon, username)
                 except Exception as e:
                     logger.error(f"Ошибка сохранения при recheck: {e}")
             else:
@@ -743,13 +981,9 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🔍 Список листов":
         try:
             spreadsheet = get_spreadsheet()
-            sheets = spreadsheet.worksheets()
-            lines = [f"📊 Листов: <b>{len(sheets)}</b>\n"]
-            for sheet in sheets:
-                rows = sheet.get_all_values()
-                tag = " ⚙️" if sheet.title in SYSTEM_SHEETS else ""
-                lines.append(f"• <b>{sheet.title}</b>{tag} — {len(rows)} строк")
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            await update.message.reply_text(
+                await build_sheets_report(spreadsheet), parse_mode="HTML"
+            )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -784,7 +1018,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"🔄 Проверяю {len(pending_checks)} хешей...")
         found_count, not_found_list = 0, []
         for tx_hash, data in list(pending_checks.items()):
-            if await check_hash_with_tron(tx_hash):
+            found, amount, recon = await check_hash_with_tron(tx_hash)
+            if found:
                 found_count += 1
                 pending_checks.pop(tx_hash, None)
                 processing_hashes.discard(tx_hash.lower())
@@ -792,7 +1027,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     spreadsheet = get_spreadsheet()
                     user = data.get("user")
                     username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
-                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, "")
+                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
+                    await notify_amount_mismatch(context.bot, tx_hash, recon, username)
                 except Exception as e:
                     logger.error(f"Ошибка сохранения при recheck: {e}")
             else:
@@ -828,13 +1064,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "debug":
         try:
             spreadsheet = get_spreadsheet()
-            sheets = spreadsheet.worksheets()
-            lines = [f"📊 Листов: <b>{len(sheets)}</b>\n"]
-            for sheet in sheets:
-                rows = sheet.get_all_values()
-                tag = " ⚙️" if sheet.title in SYSTEM_SHEETS else ""
-                lines.append(f"• <b>{sheet.title}</b>{tag} — {len(rows)} строк")
-            await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+            await query.edit_message_text(
+                await build_sheets_report(spreadsheet), parse_mode="HTML"
+            )
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
 
@@ -889,6 +1121,13 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     seen_in_run = set()
+    mismatches = []
+
+    if skipped_sheets:
+        lines = ["⚠️ <b>Листы пропущены (бот их не трогает):</b>\n"]
+        for title, reason in skipped_sheets.items():
+            lines.append(f"• <b>{title}</b> — {reason}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     for i, tx_hash in enumerate(hashes):
         if i < start_index:
@@ -920,13 +1159,18 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             else:
                 seen_in_run.add(tx_hash.lower())
-                sheet, row_index, row = find_hash_in_loaded_data(tx_hash, sheets_data)
+                sheet, row_index, row, binding = find_hash_in_loaded_data(tx_hash, sheets_data)
                 if sheet and row_index:
-                    status = row[13] if len(row) > 13 else ""
+                    si = binding["status"]
+                    status = row[si] if len(row) > si else ""
                     hash_amount = ""
                     if not status:
-                        result, hash_amount = await verify_and_write_tron_data(sheet, row_index, tx_hash)
+                        result, hash_amount, recon = await verify_and_write_tron_data(
+                            sheet, binding, row_index, tx_hash, row
+                        )
                         logger.info(f"[{i+1}/{total}] Обработан: {tx_hash[:20]} — {result}")
+                        if recon.startswith("⚠️"):
+                            mismatches.append(f"{tx_hash} — {recon}")
                     else:
                         logger.info(f"[{i+1}/{total}] Уже обработан: {tx_hash[:20]}")
                     found_count += 1
@@ -984,9 +1228,19 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Найдено и обработано: {found_count}\n"
             f"Не найдено в таблице: {len(not_found)}\n"
             f"Дублей пропущено: {len(duplicates)}\n"
-            f"Ошибок: {len(errors)}",
+            f"Ошибок: {len(errors)}\n"
+            f"Расхождений по сумме: {len(mismatches)}",
             parse_mode="HTML"
         )
+        if mismatches:
+            chunk = 30
+            for idx in range(0, len(mismatches), chunk):
+                part = mismatches[idx:idx + chunk]
+                lines = [f"⚠️ <b>Расхождения по сумме "
+                         f"({idx+1}-{idx+len(part)} из {len(mismatches)}):</b>\n"]
+                for m in part:
+                    lines.append(f"<code>{m}</code>")
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         if not_found:
             chunk_size = 50
             for idx in range(0, len(not_found), chunk_size):
@@ -1009,18 +1263,31 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔍 Ищу: {tx_hash[:20]}...\nДлина: {len(tx_hash)} символов")
     try:
         spreadsheet = get_spreadsheet()
-        sheets = [s for s in spreadsheet.worksheets() if s.title not in SYSTEM_SHEETS]
+        sheets = [s for s in spreadsheet.worksheets() if is_register_sheet(s.title)]
+        target = tx_hash.lower()
+        skipped = []
         for sheet in sheets:
             rows = sheet.get_all_values()
+            binding, reason = bind_columns(rows)
+            if binding is None:
+                skipped.append(f"{sheet.title} — {reason}")
+                continue
+            col = binding["hash"]
             for i, row in enumerate(rows):
-                if len(row) > 12 and row[12].strip().lower() == tx_hash.lower():
+                if i == 0:
+                    continue
+                if len(row) > col and row[col].strip().lower() == target:
                     await update.message.reply_text(
-                        f"✅ Найден!\nЛист: {sheet.title}\nСтрока: {i+1}\n"
-                        f"Значение: <code>{row[12]}</code>",
+                        f"✅ Найден!\nЛист: {sheet.title}\n"
+                        f"Строка: {i+1}, колонка: {col_letter(col)}\n"
+                        f"Значение: <code>{row[col]}</code>",
                         parse_mode="HTML"
                     )
                     return
-        await update.message.reply_text("❌ Не найден ни в одном листе")
+        msg = "❌ Не найден ни в одном листе-реестре"
+        if skipped:
+            msg += "\n\nПропущены листы:\n" + "\n".join(f"• {x}" for x in skipped)
+        await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -1029,13 +1296,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         spreadsheet = get_spreadsheet()
-        sheets = spreadsheet.worksheets()
-        lines = [f"📊 Таблица открыта. Листов: {len(sheets)}\n"]
-        for sheet in sheets:
-            rows = sheet.get_all_values()
-            tag = " ⚙️" if sheet.title in SYSTEM_SHEETS else ""
-            lines.append(f"• <b>{sheet.title}</b>{tag} — {len(rows)} строк")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        await update.message.reply_text(
+            await build_sheets_report(spreadsheet), parse_mode="HTML"
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
