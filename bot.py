@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import gspread
+from gspread.utils import absolute_range_name
 from google.oauth2.service_account import Credentials
 
 # ========================
@@ -18,7 +19,7 @@ TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID          = int(os.environ["ADMIN_ID"])  # главный админ (для обратной совместимости)
 ADMIN_IDS         = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", os.environ["ADMIN_ID"]).split(",")]
 SPREADSHEET_ID    = os.environ["SPREADSHEET_ID"]
-TRON_API_KEY      = os.environ.get("TRON_API_KEY", "3a47f76f-f6aa-412c-9651-824df43c2d09")
+TRON_API_KEY      = os.environ["TRON_API_KEY"]
 CHECK_DELAY_HOURS = 1
 
 TRON_WALLETS = [
@@ -177,6 +178,11 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+# httpx на уровне INFO печатает URL целиком, а токен бота — часть URL.
+# Без этих двух строк весь лог Railway состоит из строк с токеном.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # ========================
@@ -200,6 +206,8 @@ not_found_total: int   = 0
 _spreadsheet_cache     = None
 skipped_sheets: dict   = {}   # лист -> причина, по которой бот его не трогает
 background_tasks: set  = set()  # ссылки на фоновые задачи, иначе GC их соберёт
+checkall_hashes: set   = set()  # хеши, проверенные прогоном, а не присланные людьми
+checkall_state: dict   = {"running": False, "done": 0, "total": 0, "started": None}
 
 # ========================
 # GOOGLE SHEETS — СОЕДИНЕНИЕ
@@ -251,6 +259,38 @@ async def sheets_write_with_retry(func, *args, max_attempts: int = 5, **kwargs):
     logger.error(f"Превышено количество попыток записи")
     return None
 
+async def sheets_read_with_retry(func, *args, max_attempts: int = 4, **kwargs):
+    """Обёртка для чтения. При 429 ждёт окно квоты и повторяет."""
+    last = None
+    for attempt in range(max_attempts):
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: func(*args, **kwargs)
+            )
+        except Exception as e:
+            last = e
+            if "429" in str(e) or "RATE_LIMIT" in str(e) or "Quota" in str(e):
+                wait = 60 * (attempt + 1)
+                logger.warning(f"Read 429, жду {wait}с (попытка {attempt+1}/{max_attempts})...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    raise last
+
+
+async def batch_get_ranges(spreadsheet, ranges: list, group: int = 80) -> list:
+    """
+    Забирает много диапазонов ЗА ОДИН запрос вместо запроса на лист.
+    Квота Google — 60 чтений в минуту, а листов у нас под сотню.
+    """
+    out = []
+    for i in range(0, len(ranges), group):
+        part = ranges[i:i + group]
+        resp = await sheets_read_with_retry(spreadsheet.values_batch_get, part)
+        out.extend(resp.get("valueRanges", []))
+    return out
+
+
 # ========================
 # USED HASHES
 # Структура: хеш | user_id | дата_время
@@ -262,12 +302,19 @@ def load_used_hashes(spreadsheet) -> set:
         sheet.append_row(["хеш", "user_id", "ник", "сумма", "дата_время"])
         return set()
     hashes = set()
+    checkall_hashes.clear()
     # Пропускаем первую строку если это заголовок
     start = 1 if all_rows[0] and not re.match(r"[0-9a-fA-F]{32,}", all_rows[0][0]) else 0
     for row in all_rows[start:]:
         if row and row[0].strip():
-            hashes.add(row[0].strip().lower())
-    logger.info(f"Загружено {len(hashes)} использованных хешей")
+            h = row[0].strip().lower()
+            hashes.add(h)
+            # колонка "ник": прогон подписывается @checkall — такие хеши
+            # не являются дублями, если оператор пришлёт их потом в чат
+            if len(row) > 2 and row[2].strip().lower() == "@checkall":
+                checkall_hashes.add(h)
+    logger.info(f"Загружено {len(hashes)} использованных хешей "
+                f"(из них {len(checkall_hashes)} проверены прогоном)")
     return hashes
 
 async def save_used_hash(spreadsheet, tx_hash: str, user_id: int, username: str = "", amount: str = ""):
@@ -792,37 +839,111 @@ async def _delayed_check_once(application):
 # ========================
 # ДИАГНОСТИКА ЛИСТОВ
 # ========================
-async def build_sheets_report(spreadsheet) -> str:
-    """Что бот видит, куда привязался, что пропускает и почему."""
+def chunk_lines(lines: list, limit: int = 3500) -> list:
+    """Режет список строк на куски, влезающие в одно сообщение Telegram."""
+    chunks, buf, size = [], [], 0
+    for line in lines:
+        if buf and size + len(line) + 1 > limit:
+            chunks.append("\n".join(buf))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks or [""]
+
+
+async def build_sheets_report(spreadsheet) -> list:
+    """
+    Что бот видит, куда привязался, что пропускает и почему.
+    Читает ТОЛЬКО строку 1 каждого листа — одним batch-запросом, а не
+    запросом на лист: иначе на 68 листах мы упираемся в квоту 60 чтений/мин.
+    Возвращает СПИСОК сообщений: список листов длинный и в одно не влезает.
+    """
     sheets = spreadsheet.worksheets()
-    lines = [f"📊 Листов всего: <b>{len(sheets)}</b>\n"]
-    for sheet in sheets:
-        rows = await asyncio.get_event_loop().run_in_executor(None, sheet.get_all_values)
-        title = sheet.title
+    titles = [sh.title for sh in sheets]
+
+    # запрос 1: строка заголовков со всех листов
+    header_ranges = [absolute_range_name(t, "1:1") for t in titles]
+    headers_raw = await batch_get_ranges(spreadsheet, header_ranges)
+    headers = {}
+    for t, vr in zip(titles, headers_raw):
+        vals = vr.get("values") or []
+        headers[t] = vals[0] if vals else []
+
+    lines = []
+    n_ok = n_blocked = n_skip = n_sys = 0
+    blocked, bound = [], {}
+
+    for title in titles:
         if title.startswith("_") or title in SYSTEM_SHEETS:
-            lines.append(f"• <b>{title}</b> ⚙️ служебный — {len(rows)} строк")
+            n_sys += 1
+            lines.append(f"• <b>{title}</b> ⚙️ служебный")
             continue
         if not is_register_sheet(title):
+            n_skip += 1
             lines.append(f"• <b>{title}</b> — не реестр, пропускается")
             continue
-        binding, reason = bind_columns(rows)
+        binding, reason = bind_columns([headers[title]])
         if binding is None:
-            lines.append(f"• <b>{title}</b> ⛔ {reason}")
+            n_blocked += 1
+            blocked.append((title, reason))
             skipped_sheets[title] = reason
+            lines.append(f"• <b>{title}</b> ⛔ {reason}")
         else:
+            n_ok += 1
             skipped_sheets.pop(title, None)
-            declared = (col_letter(binding["declared"])
-                        if binding["declared"] is not None else "нет")
+            bound[title] = binding
+
+    # запрос 2: колонка хеша у привязанных листов — чтобы знать объём работ
+    counts = {}
+    if bound:
+        hash_ranges = [
+            absolute_range_name(t, f"{col_letter(b['hash'])}:{col_letter(b['hash'])}")
+            for t, b in bound.items()
+        ]
+        hashes_raw = await batch_get_ranges(spreadsheet, hash_ranges)
+        for t, vr in zip(bound.keys(), hashes_raw):
+            vals = vr.get("values") or []
+            counts[t] = sum(1 for r in vals[1:] if r and str(r[0]).strip())
+
+    # строки собираем заново — теперь уже с количеством хешей
+    lines = []
+    for title in titles:
+        if title.startswith("_") or title in SYSTEM_SHEETS:
+            lines.append(f"• <b>{title}</b> ⚙️ служебный")
+        elif not is_register_sheet(title):
+            lines.append(f"• <b>{title}</b> — не реестр, пропускается")
+        elif title in bound:
+            b = bound[title]
+            declared = (col_letter(b["declared"])
+                        if b["declared"] is not None else "нет")
             lines.append(
-                f"• <b>{title}</b> — {len(rows)} строк · "
-                f"хеш {col_letter(binding['hash'])} · "
-                f"пишу в {col_letter(binding['status'])}–{col_letter(binding['recon'])} · "
+                f"• <b>{title}</b> — {counts.get(title, 0)} хешей · "
+                f"хеш {col_letter(b['hash'])} · "
+                f"пишу в {col_letter(b['status'])}–{col_letter(b['recon'])} · "
                 f"заявленная сумма {declared}"
             )
-    text = "\n".join(lines)
-    if len(text) > 3800:
-        text = text[:3800] + "\n…список обрезан"
-    return text
+        else:
+            lines.append(f"• <b>{title}</b> ⛔ {skipped_sheets.get(title, '')}")
+
+    total_hashes = sum(counts.values())
+    head = (f"📊 Листов всего: <b>{len(sheets)}</b>\n"
+            f"✅ готовы к работе: <b>{n_ok}</b> ({total_hashes} хешей) · "
+            f"⛔ не готовы: <b>{n_blocked}</b> · "
+            f"не реестры: {n_skip} · служебных: {n_sys}\n")
+
+    tail = []
+    if blocked:
+        tail.append(f"\n⛔ <b>Требуют подготовки ({len(blocked)}):</b>")
+        for title, reason in blocked:
+            tail.append(f"• <b>{title}</b> — {reason}")
+
+    chunks = chunk_lines([head] + lines + tail)
+    if len(chunks) > 1:
+        chunks = [f"<i>часть {i+1}/{len(chunks)}</i>\n{c}"
+                  for i, c in enumerate(chunks)]
+    return chunks
 
 
 # ========================
@@ -846,9 +967,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Хеш от юзера {user_id}: {tx_hash[:20]}")
 
     if is_duplicate_hash(tx_hash):
+        username = f"@{user.username}" if user.username else f"id:{user_id}"
+
+        # Хеш, проверенный прогоном /checkall, — не дубль: строку в реестре
+        # обработал бот, а не человек прислал её второй раз.
+        if tx_hash.lower() in checkall_hashes:
+            logger.info(f"Уже проверен прогоном: {tx_hash[:20]} (от {user_id})")
+            await update.message.reply_text(
+                f"✅ <b>Эта транзакция уже проверена</b>\n\n"
+                f"Хеш: <code>{tx_hash}</code>\n"
+                f"Строка в реестре обработана ботом ранее, повторять не нужно.",
+                parse_mode="HTML"
+            )
+            try:
+                spreadsheet = get_spreadsheet()
+                await save_duplicate(spreadsheet, tx_hash, user)
+                await notify_admins(
+                    context.bot,
+                    f"ℹ️ <b>Повторная присылка уже проверенного хеша</b>\n\n"
+                    f"Хеш: <code>{tx_hash}</code>\n"
+                    f"Юзер: {username}\n\n"
+                    f"Строку обработал прогон. Это не попытка провести дубль."
+                )
+            except Exception as e:
+                logger.error(f"Ошибка записи повторной присылки: {e}")
+            return
+
         logger.warning(f"Дубль от {user_id}: {tx_hash[:20]}")
         try:
-            username = f"@{user.username}" if user.username else f"id:{user_id}"
             # Уведомляем всех админов в личку
             await notify_admins(
                 context.bot,
@@ -1013,9 +1159,8 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🔍 Список листов":
         try:
             spreadsheet = get_spreadsheet()
-            await update.message.reply_text(
-                await build_sheets_report(spreadsheet), parse_mode="HTML"
-            )
+            for part in await build_sheets_report(spreadsheet):
+                await update.message.reply_text(part, parse_mode="HTML")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -1096,9 +1241,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "debug":
         try:
             spreadsheet = get_spreadsheet()
-            await query.edit_message_text(
-                await build_sheets_report(spreadsheet), parse_mode="HTML"
-            )
+            parts = await build_sheets_report(spreadsheet)
+            await query.edit_message_text(parts[0], parse_mode="HTML")
+            for part in parts[1:]:
+                await query.message.reply_text(part, parse_mode="HTML")
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
 
@@ -1157,6 +1303,8 @@ class UsedHashBuffer:
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ])
         used_hashes_cache.add(tx_hash.lower())
+        if username.lower() == "@checkall":
+            checkall_hashes.add(tx_hash.lower())
 
     async def flush(self):
         if not self.buf:
@@ -1173,18 +1321,61 @@ class UsedHashBuffer:
             await self.flush()
 
 
+async def _run_checkall(runner, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обёртка фонового прогона: держит статус и не даёт упасть молча.
+    """
+    checkall_state.update({"running": True, "done": 0, "total": 0,
+                           "started": datetime.now()})
+    try:
+        await runner(update, context)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"Прогон прерван ошибкой: {e}")
+        try:
+            await update.message.reply_text(
+                f"❌ <b>Прогон прерван ошибкой</b>\n\n<code>{str(e)[:300]}</code>\n\n"
+                f"Обработанные строки сохранены — запусти /checkall снова, "
+                f"он продолжит с того же места.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    finally:
+        checkall_state["running"] = False
+
+
 async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /checkall       — пройти реестры и обработать строки с пустым статусом
     /checkall list  — старый режим: по списку из листа _хеши_для_проверки
+
+    Прогон уходит в ФОНОВУЮ задачу: у python-telegram-bot по умолчанию
+    max_concurrent_updates=1, и без этого бот на все двадцать минут перестал
+    бы отвечать операторам, а их хеши копились бы в очереди в памяти —
+    и пропали бы при перезапуске контейнера.
     """
     if update.message.from_user.id not in ADMIN_IDS:
         return
+
+    if checkall_state["running"]:
+        st = checkall_state
+        started = st["started"].strftime("%H:%M") if st["started"] else "?"
+        await update.message.reply_text(
+            f"⏳ <b>Прогон уже идёт</b>\n\n"
+            f"Запущен в {started}, обработано {st['done']} из {st['total']}.\n"
+            f"Дождись окончания — второй прогон писал бы в те же строки "
+            f"и вдвое быстрее сжёг квоту Google.",
+            parse_mode="HTML"
+        )
+        return
+
     mode = context.args[0].lower() if context.args else ""
-    if mode == "list":
-        await checkall_by_list(update, context)
-    else:
-        await checkall_by_registers(update, context)
+    runner = checkall_by_list if mode == "list" else checkall_by_registers
+    task = asyncio.create_task(_run_checkall(runner, update, context))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 
 async def checkall_by_registers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1222,6 +1413,9 @@ async def checkall_by_registers(update: Update, context: ContextTypes.DEFAULT_TY
         f"пропускаются, доделается только остаток.",
         parse_mode="HTML"
     )
+
+    checkall_state["total"] = total
+    checkall_state["done"] = 0
 
     used_buf = UsedHashBuffer(spreadsheet)
     seen = {}                       # хеш -> где он уже встретился в этом прогоне
@@ -1273,6 +1467,7 @@ async def checkall_by_registers(update: Update, context: ContextTypes.DEFAULT_TY
         elif not had_error and current_pause > MIN_PAUSE:
             current_pause = max(current_pause * 0.9, MIN_PAUSE)
 
+        checkall_state["done"] = n
         await asyncio.sleep(current_pause)
 
         if n % 100 == 0:
@@ -1528,9 +1723,8 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         spreadsheet = get_spreadsheet()
-        await update.message.reply_text(
-            await build_sheets_report(spreadsheet), parse_mode="HTML"
-        )
+        for part in await build_sheets_report(spreadsheet):
+            await update.message.reply_text(part, parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
