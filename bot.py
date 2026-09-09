@@ -17,12 +17,14 @@ TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID          = int(os.environ["ADMIN_ID"])  # главный админ (для обратной совместимости)
 ADMIN_IDS         = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", os.environ["ADMIN_ID"]).split(",")]
 SPREADSHEET_ID    = os.environ["SPREADSHEET_ID"]
-TRON_API_KEY      = os.environ.get("TRON_API_KEY", "3a47f76f-f6aa-412c-9651-824df43c2d09")
+TRON_API_KEY      = os.environ["TRON_API_KEY"]
 CHECK_DELAY_HOURS = 1
 
 TRON_WALLETS = [
     "TX6z5khTbArfSSV4b2yioUxhMytyWBNjC8",
     "TXZrknLXgXciqFK5seMiiTpH4DNwBydo9G",
+    "TGfJMbySkZQKc68Rc6cHWZ7ohCEVbeyY41",
+    "TN43HtnfYDxdj4b9ML4gin4S2816yJQArA",
 ]
 
 GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDENTIALS"])
