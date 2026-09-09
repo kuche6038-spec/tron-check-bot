@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import gspread
+from gspread.utils import absolute_range_name
 from google.oauth2.service_account import Credentials
 
 # ========================
@@ -251,6 +252,38 @@ async def sheets_write_with_retry(func, *args, max_attempts: int = 5, **kwargs):
                 raise
     logger.error(f"Превышено количество попыток записи")
     return None
+
+async def sheets_read_with_retry(func, *args, max_attempts: int = 4, **kwargs):
+    """Обёртка для чтения. При 429 ждёт окно квоты и повторяет."""
+    last = None
+    for attempt in range(max_attempts):
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: func(*args, **kwargs)
+            )
+        except Exception as e:
+            last = e
+            if "429" in str(e) or "RATE_LIMIT" in str(e) or "Quota" in str(e):
+                wait = 60 * (attempt + 1)
+                logger.warning(f"Read 429, жду {wait}с (попытка {attempt+1}/{max_attempts})...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    raise last
+
+
+async def batch_get_ranges(spreadsheet, ranges: list, group: int = 80) -> list:
+    """
+    Забирает много диапазонов ЗА ОДИН запрос вместо запроса на лист.
+    Квота Google — 60 чтений в минуту, а листов у нас под сотню.
+    """
+    out = []
+    for i in range(0, len(ranges), group):
+        part = ranges[i:i + group]
+        resp = await sheets_read_with_retry(spreadsheet.values_batch_get, part)
+        out.extend(resp.get("valueRanges", []))
+    return out
+
 
 # ========================
 # USED HASHES
@@ -782,52 +815,88 @@ def chunk_lines(lines: list, limit: int = 3500) -> list:
 async def build_sheets_report(spreadsheet) -> list:
     """
     Что бот видит, куда привязался, что пропускает и почему.
+    Читает ТОЛЬКО строку 1 каждого листа — одним batch-запросом, а не
+    запросом на лист: иначе на 68 листах мы упираемся в квоту 60 чтений/мин.
     Возвращает СПИСОК сообщений: список листов длинный и в одно не влезает.
     """
     sheets = spreadsheet.worksheets()
+    titles = [sh.title for sh in sheets]
+
+    # запрос 1: строка заголовков со всех листов
+    header_ranges = [absolute_range_name(t, "1:1") for t in titles]
+    headers_raw = await batch_get_ranges(spreadsheet, header_ranges)
+    headers = {}
+    for t, vr in zip(titles, headers_raw):
+        vals = vr.get("values") or []
+        headers[t] = vals[0] if vals else []
+
     lines = []
     n_ok = n_blocked = n_skip = n_sys = 0
-    blocked = []
+    blocked, bound = [], {}
 
-    for sheet in sheets:
-        rows = await asyncio.get_event_loop().run_in_executor(None, sheet.get_all_values)
-        title = sheet.title
+    for title in titles:
         if title.startswith("_") or title in SYSTEM_SHEETS:
             n_sys += 1
-            lines.append(f"• <b>{title}</b> ⚙️ служебный — {len(rows)} строк")
+            lines.append(f"• <b>{title}</b> ⚙️ служебный")
             continue
         if not is_register_sheet(title):
             n_skip += 1
             lines.append(f"• <b>{title}</b> — не реестр, пропускается")
             continue
-        binding, reason = bind_columns(rows)
+        binding, reason = bind_columns([headers[title]])
         if binding is None:
             n_blocked += 1
-            blocked.append((title, reason, len(rows)))
+            blocked.append((title, reason))
             skipped_sheets[title] = reason
             lines.append(f"• <b>{title}</b> ⛔ {reason}")
         else:
             n_ok += 1
             skipped_sheets.pop(title, None)
-            declared = (col_letter(binding["declared"])
-                        if binding["declared"] is not None else "нет")
+            bound[title] = binding
+
+    # запрос 2: колонка хеша у привязанных листов — чтобы знать объём работ
+    counts = {}
+    if bound:
+        hash_ranges = [
+            absolute_range_name(t, f"{col_letter(b['hash'])}:{col_letter(b['hash'])}")
+            for t, b in bound.items()
+        ]
+        hashes_raw = await batch_get_ranges(spreadsheet, hash_ranges)
+        for t, vr in zip(bound.keys(), hashes_raw):
+            vals = vr.get("values") or []
+            counts[t] = sum(1 for r in vals[1:] if r and str(r[0]).strip())
+
+    # строки собираем заново — теперь уже с количеством хешей
+    lines = []
+    for title in titles:
+        if title.startswith("_") or title in SYSTEM_SHEETS:
+            lines.append(f"• <b>{title}</b> ⚙️ служебный")
+        elif not is_register_sheet(title):
+            lines.append(f"• <b>{title}</b> — не реестр, пропускается")
+        elif title in bound:
+            b = bound[title]
+            declared = (col_letter(b["declared"])
+                        if b["declared"] is not None else "нет")
             lines.append(
-                f"• <b>{title}</b> — {len(rows)} строк · "
-                f"хеш {col_letter(binding['hash'])} · "
-                f"пишу в {col_letter(binding['status'])}–{col_letter(binding['recon'])} · "
+                f"• <b>{title}</b> — {counts.get(title, 0)} хешей · "
+                f"хеш {col_letter(b['hash'])} · "
+                f"пишу в {col_letter(b['status'])}–{col_letter(b['recon'])} · "
                 f"заявленная сумма {declared}"
             )
+        else:
+            lines.append(f"• <b>{title}</b> ⛔ {skipped_sheets.get(title, '')}")
 
+    total_hashes = sum(counts.values())
     head = (f"📊 Листов всего: <b>{len(sheets)}</b>\n"
-            f"✅ готовы к работе: <b>{n_ok}</b> · "
+            f"✅ готовы к работе: <b>{n_ok}</b> ({total_hashes} хешей) · "
             f"⛔ не готовы: <b>{n_blocked}</b> · "
             f"не реестры: {n_skip} · служебных: {n_sys}\n")
 
     tail = []
     if blocked:
         tail.append(f"\n⛔ <b>Требуют подготовки ({len(blocked)}):</b>")
-        for title, reason, nrows in blocked:
-            tail.append(f"• <b>{title}</b> ({nrows} строк) — {reason}")
+        for title, reason in blocked:
+            tail.append(f"• <b>{title}</b> — {reason}")
 
     chunks = chunk_lines([head] + lines + tail)
     if len(chunks) > 1:
