@@ -174,6 +174,11 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+# httpx на уровне INFO печатает URL целиком, а токен бота — часть URL.
+# Без этих двух строк весь лог Railway состоит из строк с токеном.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # ========================
@@ -760,24 +765,49 @@ async def delayed_check_loop(application):
 # ========================
 # ДИАГНОСТИКА ЛИСТОВ
 # ========================
-async def build_sheets_report(spreadsheet) -> str:
-    """Что бот видит, куда привязался, что пропускает и почему."""
+def chunk_lines(lines: list, limit: int = 3500) -> list:
+    """Режет список строк на куски, влезающие в одно сообщение Telegram."""
+    chunks, buf, size = [], [], 0
+    for line in lines:
+        if buf and size + len(line) + 1 > limit:
+            chunks.append("\n".join(buf))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks or [""]
+
+
+async def build_sheets_report(spreadsheet) -> list:
+    """
+    Что бот видит, куда привязался, что пропускает и почему.
+    Возвращает СПИСОК сообщений: список листов длинный и в одно не влезает.
+    """
     sheets = spreadsheet.worksheets()
-    lines = [f"📊 Листов всего: <b>{len(sheets)}</b>\n"]
+    lines = []
+    n_ok = n_blocked = n_skip = n_sys = 0
+    blocked = []
+
     for sheet in sheets:
         rows = await asyncio.get_event_loop().run_in_executor(None, sheet.get_all_values)
         title = sheet.title
         if title.startswith("_") or title in SYSTEM_SHEETS:
+            n_sys += 1
             lines.append(f"• <b>{title}</b> ⚙️ служебный — {len(rows)} строк")
             continue
         if not is_register_sheet(title):
+            n_skip += 1
             lines.append(f"• <b>{title}</b> — не реестр, пропускается")
             continue
         binding, reason = bind_columns(rows)
         if binding is None:
-            lines.append(f"• <b>{title}</b> ⛔ {reason}")
+            n_blocked += 1
+            blocked.append((title, reason, len(rows)))
             skipped_sheets[title] = reason
+            lines.append(f"• <b>{title}</b> ⛔ {reason}")
         else:
+            n_ok += 1
             skipped_sheets.pop(title, None)
             declared = (col_letter(binding["declared"])
                         if binding["declared"] is not None else "нет")
@@ -787,10 +817,23 @@ async def build_sheets_report(spreadsheet) -> str:
                 f"пишу в {col_letter(binding['status'])}–{col_letter(binding['recon'])} · "
                 f"заявленная сумма {declared}"
             )
-    text = "\n".join(lines)
-    if len(text) > 3800:
-        text = text[:3800] + "\n…список обрезан"
-    return text
+
+    head = (f"📊 Листов всего: <b>{len(sheets)}</b>\n"
+            f"✅ готовы к работе: <b>{n_ok}</b> · "
+            f"⛔ не готовы: <b>{n_blocked}</b> · "
+            f"не реестры: {n_skip} · служебных: {n_sys}\n")
+
+    tail = []
+    if blocked:
+        tail.append(f"\n⛔ <b>Требуют подготовки ({len(blocked)}):</b>")
+        for title, reason, nrows in blocked:
+            tail.append(f"• <b>{title}</b> ({nrows} строк) — {reason}")
+
+    chunks = chunk_lines([head] + lines + tail)
+    if len(chunks) > 1:
+        chunks = [f"<i>часть {i+1}/{len(chunks)}</i>\n{c}"
+                  for i, c in enumerate(chunks)]
+    return chunks
 
 
 # ========================
@@ -981,9 +1024,8 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🔍 Список листов":
         try:
             spreadsheet = get_spreadsheet()
-            await update.message.reply_text(
-                await build_sheets_report(spreadsheet), parse_mode="HTML"
-            )
+            for part in await build_sheets_report(spreadsheet):
+                await update.message.reply_text(part, parse_mode="HTML")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -1064,9 +1106,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "debug":
         try:
             spreadsheet = get_spreadsheet()
-            await query.edit_message_text(
-                await build_sheets_report(spreadsheet), parse_mode="HTML"
-            )
+            parts = await build_sheets_report(spreadsheet)
+            await query.edit_message_text(parts[0], parse_mode="HTML")
+            for part in parts[1:]:
+                await query.message.reply_text(part, parse_mode="HTML")
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
 
@@ -1296,9 +1339,8 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         spreadsheet = get_spreadsheet()
-        await update.message.reply_text(
-            await build_sheets_report(spreadsheet), parse_mode="HTML"
-        )
+        for part in await build_sheets_report(spreadsheet):
+            await update.message.reply_text(part, parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
