@@ -39,8 +39,14 @@ GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 SHEET_MARKER     = "реестр"           # обрабатываются только листы с этим словом в названии
 AMOUNT_TOLERANCE = Decimal("0.01")    # допустимое расхождение сумм, USDT
 
-# Заголовки бота — четыре колонки сразу за колонкой хеша
-BOT_HEADERS = ["статус бота", "сумма в сети", "проверка адреса", "сверка суммы"]
+# Заголовки бота — четыре колонки сразу за колонкой хеша.
+# Первая называет ФАКТ О ЧЕЛОВЕКЕ: оператор прислал этот хеш в чат.
+# Остальные три — факт о транзакции. Это разные вещи, и путать их нельзя.
+SENT_MARK   = "✅ отправлен в чат"
+BOT_HEADERS = ["отправлен в чат", "сумма в сети", "проверка адреса", "сверка суммы"]
+# Прежнее название той же колонки. Признаём своим, чтобы уже размеченные
+# листы не отвалились как «занято чужим заголовком».
+LEGACY_HEADERS = {0: {"статус бота"}}
 
 
 def col_letter(idx: int) -> str:
@@ -122,13 +128,18 @@ def bind_columns(rows: list):
             idx_declared = i
             break
 
+    def ours(k: int, value: str) -> bool:
+        return value == BOT_HEADERS[k] or value in LEGACY_HEADERS.get(k, set())
+
     targets = [idx_hash + 1 + k for k in range(len(BOT_HEADERS))]
     for k, t in enumerate(targets):
         current = _norm(header[t]) if t < len(header) else ""
-        if current and current != BOT_HEADERS[k]:
+        if current and not ours(k, current):
             return None, (f"колонка {col_letter(t)} занята чужим заголовком "
                           f"'{header[t]}'")
 
+    # заголовки считаем на месте только если они уже в НОВОМ написании:
+    # старое перепишем при первой записи
     headers_present = all(
         t < len(header) and _norm(header[t]) == BOT_HEADERS[k]
         for k, t in enumerate(targets)
@@ -164,9 +175,12 @@ SYSTEM_SHEETS = {
     "_прогресс_проверки",
 }
 
-# Адаптивная пауза для /checkall
-MIN_PAUSE = 1.0
-MAX_PAUSE = 10.0
+# Адаптивная пауза для /checkall.
+# Квота Google — 60 записей в минуту. Один хеш это ~1.05 записи
+# (строка реестра + пачка в _использованные_хеши раз в 20 штук),
+# так что 1.5с даёт ~40 хешей и ~42 записи в минуту — с запасом.
+MIN_PAUSE = 1.5
+MAX_PAUSE = 30.0
 
 # ========================
 # ЛОГИРОВАНИЕ
@@ -202,6 +216,8 @@ processing_hashes: set = set()
 not_found_total: int   = 0
 _spreadsheet_cache     = None
 skipped_sheets: dict   = {}   # лист -> причина, по которой бот его не трогает
+background_tasks: set  = set()  # ссылки на фоновые задачи, иначе GC их соберёт
+checkall_state: dict   = {"running": False, "done": 0, "total": 0, "started": None}
 
 # ========================
 # GOOGLE SHEETS — СОЕДИНЕНИЕ
@@ -417,11 +433,16 @@ async def save_pending_queue(spreadsheet):
                 username,
                 data["check_at"].strftime("%Y-%m-%d %H:%M:%S")
             ])
-        await sheets_write_with_retry(sheet.clear)
-        if len(rows) > 1:
-            await sheets_write_with_retry(sheet.update, f"A1:D{len(rows)}", rows)
-        else:
-            await sheets_write_with_retry(sheet.append_row, rows[0])
+        # Порядок важен: СНАЧАЛА пишем данные, ПОТОМ стираем хвост от прошлого
+        # раза. Прежний порядок (clear -> update) при сбое между шагами оставлял
+        # лист пустым, а в лог всё равно писалось "Очередь сохранена".
+        written = await sheets_write_with_retry(
+            sheet.update, range_name=f"A1:D{len(rows)}", values=rows
+        )
+        if written is None:
+            logger.error("Очередь НЕ сохранена: запись не подтверждена Google Sheets")
+            return
+        await sheets_write_with_retry(sheet.batch_clear, [f"A{len(rows) + 1}:D10000"])
         logger.info(f"Очередь сохранена: {len(pending_checks)} хешей")
     except Exception as e:
         logger.error(f"Ошибка сохранения очереди: {e}")
@@ -444,52 +465,6 @@ def load_hashes_to_check(spreadsheet) -> list:
     except Exception as e:
         logger.error(f"Ошибка загрузки хешей_для_проверки: {e}")
         return []
-
-# ========================
-# CHECKALL PROGRESS
-# Структура: последний_индекс | найдено | не_найдено | ошибки | дублей | пауза
-# ========================
-def save_checkall_progress(spreadsheet, last_index: int, found_count: int,
-                            not_found: list, errors: list, duplicates: list, current_pause: float):
-    try:
-        sheet = get_or_create_sheet(spreadsheet, "_прогресс_проверки", rows=3, cols=6)
-        sheet.clear()
-        sheet.update("A1:F1", [["последний_индекс", "найдено", "не_найдено_json", "ошибки_json", "дублей_json", "пауза"]])
-        sheet.update("A2:F2", [[
-            last_index,
-            found_count,
-            json.dumps(not_found),
-            json.dumps(errors),
-            json.dumps(duplicates),
-            current_pause
-        ]])
-    except Exception as e:
-        logger.error(f"Ошибка сохранения прогресса: {e}")
-
-def load_checkall_progress(spreadsheet) -> dict | None:
-    try:
-        sheet = get_or_create_sheet(spreadsheet, "_прогресс_проверки", rows=3, cols=6)
-        all_rows = sheet.get_all_values()
-        if len(all_rows) < 2 or not all_rows[1][0]:
-            return None
-        row = all_rows[1]
-        return {
-            "last_index":  int(row[0]) if row[0] else 0,
-            "found_count": int(row[1]) if row[1] else 0,
-            "not_found":   json.loads(row[2]) if row[2] else [],
-            "errors":      json.loads(row[3]) if row[3] else [],
-            "duplicates":  json.loads(row[4]) if row[4] else [],
-            "current_pause": float(row[5]) if len(row) > 5 and row[5] else MIN_PAUSE,
-        }
-    except Exception:
-        return None
-
-def clear_checkall_progress(spreadsheet):
-    try:
-        sheet = get_or_create_sheet(spreadsheet, "_прогресс_проверки", rows=3, cols=6)
-        sheet.clear()
-    except Exception as e:
-        logger.error(f"Ошибка очистки прогресса: {e}")
 
 # ========================
 # GOOGLE SHEETS — ПОИСК
@@ -576,19 +551,21 @@ async def find_hash_in_all_sheets(tx_hash: str):
 # ========================
 # BATCH ЗАПИСЬ В ОСНОВНУЮ ТАБЛИЦУ
 # ========================
-async def mark_and_write_batch(sheet, binding: dict, row_index: int,
-                               status: str, amount: str, addr_result: str, recon: str):
+async def mark_and_write_batch(sheet, binding: dict, row_index: int, values: dict):
     """
-    Записывает статус, сумму, адрес и сверку ОДНИМ batch запросом.
-    Колонки берутся из привязки, а не из констант.
+    Пишет ТОЛЬКО переданные колонки одним batch-запросом.
+    values: {"status"|"amount"|"addr"|"recon": текст}.
+    Пустой словарь — значит писать нечего, и мы ничего не трогаем:
+    строка без записи вернётся в работу на следующем прогоне.
     """
+    if not values:
+        return None
     try:
         await ensure_bot_headers(sheet, binding)
         updates = [
-            {"range": f"{col_letter(binding['status'])}{row_index}", "values": [[safe_cell(status)]]},
-            {"range": f"{col_letter(binding['amount'])}{row_index}", "values": [[safe_cell(amount)]]},
-            {"range": f"{col_letter(binding['addr'])}{row_index}",   "values": [[safe_cell(addr_result)]]},
-            {"range": f"{col_letter(binding['recon'])}{row_index}",  "values": [[safe_cell(recon)]]},
+            {"range": f"{col_letter(binding[key])}{row_index}",
+             "values": [[safe_cell(text)]]}
+            for key, text in values.items()
         ]
         # USER_ENTERED: без него Google Sheets положит "8018,5" как ТЕКСТ,
         # и колонка перестанет суммироваться
@@ -604,10 +581,16 @@ async def mark_and_write_batch(sheet, binding: dict, row_index: int,
         logger.error(f"Ошибка batch записи строки {row_index}: {e}")
         raise
 
+
 # ========================
 # TRON API
 # ========================
-async def get_tron_transaction(tx_hash: str) -> dict:
+async def get_tron_transaction(tx_hash: str):
+    """
+    Ответ Tronscan или None, если ответа НЕ БЫЛО.
+    Различать обязательно: «транзакции нет» — это результат проверки,
+    а «API не ответил» — это отсутствие проверки, и строку закрывать нельзя.
+    """
     url = f"https://apilist.tronscanapi.com/api/transaction-info?hash={tx_hash}"
     headers = {"TRON-PRO-API-KEY": TRON_API_KEY}
     try:
@@ -618,37 +601,21 @@ async def get_tron_transaction(tx_hash: str) -> dict:
                         return await resp.json()
                     except Exception:
                         logger.error(f"Tronscan невалидный JSON для {tx_hash[:20]}")
-                        return {}
+                        return None
                 else:
                     logger.error(f"Tronscan HTTP {resp.status} для {tx_hash[:20]}")
     except asyncio.TimeoutError:
         logger.error(f"Tronscan timeout для {tx_hash[:20]}")
     except Exception as e:
         logger.error(f"Ошибка TRON API: {e}")
-    return {}
+    return None
 
-async def verify_and_write_tron_data(sheet, binding: dict, row_index: int,
-                                     tx_hash: str, row: list = None) -> tuple[str, str, str]:
-    """
-    Проверяет транзакцию и записывает результат ОДНИМ batch запросом.
-    Возвращает (result_str, amount, recon).
-    """
-    data = await get_tron_transaction(tx_hash)
-
-    if not data:
-        await mark_and_write_batch(sheet, binding, row_index,
-                                   "✅ обработано", "⚠️ API недоступен", "—", "—")
-        return "API недоступен", "", "—"
-
+def _tron_verdict(data: dict, row: list, binding: dict) -> tuple[str, str, str]:
+    """Из ответа Tronscan — (сумма, проверка адреса, сверка)."""
     if data.get("contractRet") == "FAILED":
-        await mark_and_write_batch(sheet, binding, row_index,
-                                   "✅ обработано", "⚠️ транзакция FAILED", "—", "—")
-        return "транзакция FAILED", "", "—"
-
+        return "⚠️ транзакция FAILED", "—", "—"
     if not data.get("trc20TransferInfo") and not data.get("contractData"):
-        await mark_and_write_batch(sheet, binding, row_index,
-                                   "✅ обработано", "⚠️ нет данных", "—", "—")
-        return "нет данных транзакции", "", "—"
+        return "⚠️ нет данных", "—", "—"
 
     amount_dec = None
     to_address = ""
@@ -697,23 +664,51 @@ async def verify_and_write_tron_data(sheet, binding: dict, row_index: int,
         recon = (f"⚠️ заявлено {format_amount(declared)}, "
                  f"в сети {format_amount(amount_dec)}")
 
-    await mark_and_write_batch(sheet, binding, row_index,
-                               "✅ обработано", amount, addr_result, recon)
-    return f"сумма: {amount}, {addr_result}, {recon}", amount, recon
+    return amount, addr_result, recon
+
+
+async def mark_sent_and_verify(sheet, binding: dict, row_index: int,
+                               tx_hash: str, row: list = None) -> dict:
+    """
+    Отмечает «отправлен в чат» и, если Tronscan ответил, дописывает
+    сумму, адрес и сверку.
+
+    Факт присылки НЕ зависит от блокчейна: оператор прислал хеш независимо
+    от того, доступен ли сейчас Tronscan. Поэтому колонка «отправлен в чат»
+    ставится всегда, а три колонки проверки — только когда есть что писать.
+    Не ответил API — они остаются пустыми, и строку доберёт следующий прогон.
+
+    Возвращает {"verified": bool, "amount": str, "recon": str, "addr": str}.
+    """
+    data = await get_tron_transaction(tx_hash)
+    values = {"status": SENT_MARK}
+    out = {"verified": False, "amount": "", "recon": "", "addr": ""}
+
+    if data is not None:
+        amount, addr_result, recon = _tron_verdict(data, row, binding)
+        values.update({"amount": amount, "addr": addr_result, "recon": recon})
+        out.update({"verified": True, "amount": amount,
+                    "recon": recon, "addr": addr_result})
+    else:
+        logger.warning(f"Tronscan не ответил по {tx_hash[:20]} — "
+                       f"строка {row_index} останется непроверенной")
+
+    await mark_and_write_batch(sheet, binding, row_index, values)
+    return out
+
 
 # ========================
 # ОСНОВНАЯ ЛОГИКА ПРОВЕРКИ
 # ========================
 async def check_hash_with_tron(tx_hash: str) -> tuple[bool, str, str]:
-    """Возвращает (найден, сумма, сверка)."""
+    """Возвращает (найден в реестре, сумма, сверка)."""
     try:
         sheet, row_index, row, binding = await find_hash_in_all_sheets(tx_hash)
         if sheet and row_index:
-            result, amount, recon = await verify_and_write_tron_data(
-                sheet, binding, row_index, tx_hash, row
-            )
-            logger.info(f"TRON проверка {tx_hash[:20]}: {result}")
-            return True, amount, recon
+            res = await mark_sent_and_verify(sheet, binding, row_index, tx_hash, row)
+            logger.info(f"{sheet.title}!{row_index}: отмечен, "
+                        f"проверен={res['verified']} {res['amount']} {res['addr']}")
+            return True, res["amount"], res["recon"]
         return False, "", ""
     except Exception as e:
         logger.error(f"Ошибка проверки хеша {tx_hash[:20]}: {e}")
@@ -736,64 +731,86 @@ async def notify_amount_mismatch(bot, tx_hash: str, recon: str, who: str):
 # ФОНОВЫЙ ЦИКЛ
 # ========================
 async def delayed_check_loop(application):
+    """
+    Фоновая перепроверка. Тело обёрнуто в try/except целиком: без этого одна
+    необработанная ошибка убивала цикл навсегда, молча и до самого рестарта.
+    """
     while True:
-        await asyncio.sleep(300)
-        now = datetime.now()
-        to_remove = []
-        queue_changed = False
+        try:
+            await _delayed_check_once(application)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"Сбой фоновой проверки: {e}")
+            try:
+                await notify_admins(
+                    application.bot,
+                    f"⚠️ <b>Сбой фоновой проверки</b>\n\n<code>{str(e)[:300]}</code>\n\n"
+                    f"Цикл продолжает работу."
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(60)
 
-        for tx_hash, data in list(pending_checks.items()):
-            if now < data["check_at"]:
-                continue
-            logger.info(f"Отложенная проверка: {tx_hash[:20]}")
-            found, amount, recon = await check_hash_with_tron(tx_hash)
 
-            if found:
-                try:
-                    spreadsheet = get_spreadsheet()
-                    user = data.get("user")
-                    username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
-                    await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
-                    await notify_amount_mismatch(application.bot, tx_hash, recon, username)
-                except Exception as e:
-                    logger.error(f"Ошибка сохранения в использованные_хеши: {e}")
-            else:
-                global not_found_total
-                not_found_total += 1
-                try:
-                    user = data.get("user")
-                    username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
-                    await notify_admins(
-                        application.bot,
-                        f"⚠️ <b>Хеш не найден в таблице</b>\n\n"
-                        f"Хеш: <code>{tx_hash}</code>\n"
-                        f"Юзер: {username}\n\n"
-                        f"Транзакция отсутствует после повторной проверки."
-                    )
-                    spreadsheet = get_spreadsheet()
-                    if user:
-                        await save_not_found(spreadsheet, tx_hash, user)
-                    else:
-                        class FakeUser:
-                            username = None
-                            id = data["user_id"]
-                        await save_not_found(spreadsheet, tx_hash, FakeUser())
-                except Exception as e:
-                    logger.error(f"Ошибка уведомления админа: {e}")
+async def _delayed_check_once(application):
+    await asyncio.sleep(300)
+    now = datetime.now()
+    to_remove = []
+    queue_changed = False
 
-            to_remove.append(tx_hash)
-            queue_changed = True
+    for tx_hash, data in list(pending_checks.items()):
+        if now < data["check_at"]:
+            continue
+        logger.info(f"Отложенная проверка: {tx_hash[:20]}")
+        found, amount, recon = await check_hash_with_tron(tx_hash)
 
-        for tx_hash in to_remove:
-            pending_checks.pop(tx_hash, None)
-            processing_hashes.discard(tx_hash.lower())
-
-        if queue_changed:
+        if found:
             try:
                 spreadsheet = get_spreadsheet()
-                await save_pending_queue(spreadsheet)
+                user = data.get("user")
+                username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
+                await save_used_hash(spreadsheet, tx_hash, data["user_id"], username, amount)
+                await notify_amount_mismatch(application.bot, tx_hash, recon, username)
             except Exception as e:
-                logger.error(f"Ошибка сохранения очереди: {e}")
+                logger.error(f"Ошибка сохранения в использованные_хеши: {e}")
+        else:
+            global not_found_total
+            not_found_total += 1
+            try:
+                user = data.get("user")
+                username = f"@{user.username}" if user and getattr(user, "username", None) else f"id:{data['user_id']}"
+                await notify_admins(
+                    application.bot,
+                    f"⚠️ <b>Хеш не найден в таблице</b>\n\n"
+                    f"Хеш: <code>{tx_hash}</code>\n"
+                    f"Юзер: {username}\n\n"
+                    f"Транзакция отсутствует после повторной проверки."
+                )
+                spreadsheet = get_spreadsheet()
+                if user:
+                    await save_not_found(spreadsheet, tx_hash, user)
+                else:
+                    class FakeUser:
+                        username = None
+                        id = data["user_id"]
+                    await save_not_found(spreadsheet, tx_hash, FakeUser())
+            except Exception as e:
+                logger.error(f"Ошибка уведомления админа: {e}")
+
+        to_remove.append(tx_hash)
+        queue_changed = True
+
+    for tx_hash in to_remove:
+        pending_checks.pop(tx_hash, None)
+        processing_hashes.discard(tx_hash.lower())
+
+    if queue_changed:
+        try:
+            spreadsheet = get_spreadsheet()
+            await save_pending_queue(spreadsheet)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения очереди: {e}")
 
 # ========================
 # ДИАГНОСТИКА ЛИСТОВ
@@ -926,9 +943,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Хеш от юзера {user_id}: {tx_hash[:20]}")
 
     if is_duplicate_hash(tx_hash):
+        username = f"@{user.username}" if user.username else f"id:{user_id}"
         logger.warning(f"Дубль от {user_id}: {tx_hash[:20]}")
         try:
-            username = f"@{user.username}" if user.username else f"id:{user_id}"
             # Уведомляем всех админов в личку
             await notify_admins(
                 context.bot,
@@ -1185,184 +1202,307 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========================
 # /checkall — с адаптивной паузой
 # ========================
+# ========================
+# /checkall — сверка дисциплины операторов
+#
+# Список в листе _хеши_для_проверки — это ВЫГРУЗКА ИЗ ЧАТА за период.
+# Сам факт того, что хеш попал в список, и есть доказательство: оператор
+# его прислал. Прогон переносит это доказательство в реестр.
+#
+# Отсюда главное правило: колонку «отправлен в чат» заполняют только хеши
+# из списка. Строка, оставшаяся без отметки, значит «никто не присылал» —
+# ровно тот сигнал, ради которого бот и делался. Обходить реестры и
+# метить всё подряд нельзя: это стирает сигнал, не оставляя следа.
+# ========================
+class _RunUser:
+    """Псевдо-пользователь для служебных записей во время прогона."""
+    username = "checkall"
+
+    def __init__(self):
+        self.id = ADMIN_ID
+
+
+class UsedHashBuffer:
+    """
+    Копит строки для _использованные_хеши и пишет пачкой.
+    Одна запись на 20 хешей вместо записи на каждый: квота Google — 60 записей
+    в минуту, и построчная запись вдвое сокращала бы скорость прогона.
+    """
+
+    def __init__(self, spreadsheet, size: int = 20):
+        self.spreadsheet = spreadsheet
+        self.size = size
+        self.buf = []
+
+    def add(self, tx_hash: str, user_id, username: str, amount: str):
+        self.buf.append([
+            tx_hash.lower(), str(user_id), username, amount,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ])
+        used_hashes_cache.add(tx_hash.lower())
+
+    async def flush(self):
+        if not self.buf:
+            return
+        rows, self.buf = self.buf, []
+        try:
+            sheet = get_or_create_sheet(self.spreadsheet, "_использованные_хеши", cols=5)
+            await sheets_write_with_retry(sheet.append_rows, rows)
+        except Exception as e:
+            logger.error(f"Ошибка записи пачки в _использованные_хеши: {e}")
+
+    async def maybe_flush(self):
+        if len(self.buf) >= self.size:
+            await self.flush()
+
+
+def register_stats(sheets_data: dict) -> dict:
+    """
+    По каждому реестру: сколько строк с хешем и сколько из них уже
+    отмечены как отправленные. Считается по снимку, до записи.
+    """
+    stats = {}
+    for title, data in sheets_data.items():
+        binding = data["binding"]
+        hcol, scol = binding["hash"], binding["status"]
+        total = marked = 0
+        for i, row in enumerate(data["rows"]):
+            if i == 0:
+                continue
+            if not (len(row) > hcol and row[hcol].strip()):
+                continue
+            total += 1
+            if len(row) > scol and row[scol].strip():
+                marked += 1
+        stats[title] = {"total": total, "was_marked": marked, "new": 0}
+    return stats
+
+
+async def _run_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обёртка фонового прогона: держит статус и не даёт упасть молча."""
+    checkall_state.update({"running": True, "done": 0, "total": 0,
+                           "started": datetime.now()})
+    try:
+        await checkall_run(update, context)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"Прогон прерван ошибкой: {e}")
+        try:
+            await update.message.reply_text(
+                f"❌ <b>Прогон прерван ошибкой</b>\n\n<code>{str(e)[:300]}</code>\n\n"
+                f"Отмеченные строки сохранены — запусти /checkall снова, "
+                f"он продолжит с того же места.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    finally:
+        checkall_state["running"] = False
+
+
 async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Сверяет выгруженный из чата список хешей с реестрами и показывает,
+    по каким строкам оператор не отчитался.
+
+    Прогон уходит в ФОНОВУЮ задачу: у python-telegram-bot по умолчанию
+    max_concurrent_updates=1, и без этого бот на всё время прогона перестал
+    бы отвечать операторам, а их хеши копились бы в очереди в памяти —
+    и пропали бы при перезапуске контейнера.
+    """
     if update.message.from_user.id not in ADMIN_IDS:
         return
 
-    spreadsheet = get_spreadsheet()
-    hashes = load_hashes_to_check(spreadsheet)
-    if not hashes:
+    if checkall_state["running"]:
+        st = checkall_state
+        started = st["started"].strftime("%H:%M") if st["started"] else "?"
         await update.message.reply_text(
-            "❌ Лист <b>хеши_для_проверки</b> пуст.\n\n"
-            "Добавь хеши в колонку A листа <b>хеши_для_проверки</b> и запусти снова.",
+            f"⏳ <b>Прогон уже идёт</b>\n\n"
+            f"Запущен в {started}, обработано {st['done']} из {st['total']}.\n"
+            f"Дождись окончания — второй прогон писал бы в те же строки "
+            f"и вдвое быстрее сжёг квоту Google.",
             parse_mode="HTML"
         )
         return
 
-    progress = load_checkall_progress(spreadsheet)
-    if progress:
-        start_index   = progress.get("last_index", 0)
-        found_count   = progress.get("found_count", 0)
-        not_found     = progress.get("not_found", [])
-        errors        = progress.get("errors", [])
-        duplicates    = progress.get("duplicates", [])
-        current_pause = progress.get("current_pause", MIN_PAUSE)
-        await update.message.reply_text(f"⏩ Продолжаю с места остановки (хеш #{start_index + 1})...")
-    else:
-        start_index   = 0
-        found_count   = 0
-        not_found     = []
-        errors        = []
-        duplicates    = []
-        current_pause = MIN_PAUSE
+    task = asyncio.create_task(_run_checkall(update, context))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
-    total = len(hashes)
-    await update.message.reply_text(
-        f"🔄 Загружаю таблицу в память...\n"
-        f"Всего хешей: {total}, осталось: {total - start_index}\n"
-        f"Начальная пауза: {current_pause}с"
-    )
 
+async def checkall_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    spreadsheet = get_spreadsheet()
+
+    hashes = load_hashes_to_check(spreadsheet)
+    if not hashes:
+        await update.message.reply_text(
+            "❌ Лист <b>_хеши_для_проверки</b> пуст.\n\n"
+            "Выгрузи в колонку A хеши из чата за нужный период и запусти снова. "
+            "Прогон отмечает в реестрах только то, что есть в этом списке.",
+            parse_mode="HTML"
+        )
+        return
+
+    await update.message.reply_text(f"🔄 Читаю реестры... (хешей в списке: {len(hashes)})")
     try:
         sheets_data = await load_all_sheets_data(spreadsheet)
-        await update.message.reply_text(
-            f"✅ Таблица загружена ({len(sheets_data)} листов)\n🔄 Начинаю проверку..."
-        )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка загрузки таблицы: {e}")
         return
 
-    seen_in_run = set()
-    mismatches = []
-
     if skipped_sheets:
-        lines = ["⚠️ <b>Листы пропущены (бот их не трогает):</b>\n"]
+        lines = ["⚠️ <b>Листы пропущены, бот их не трогает:</b>"]
         for title, reason in skipped_sheets.items():
             lines.append(f"• <b>{title}</b> — {reason}")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        for part in chunk_lines(lines):
+            await update.message.reply_text(part, parse_mode="HTML")
 
-    for i, tx_hash in enumerate(hashes):
-        if i < start_index:
-            continue
+    stats = register_stats(sheets_data)
+
+    total = len(hashes)
+    checkall_state["total"] = total
+    checkall_state["done"] = 0
+    current_pause = MIN_PAUSE
+    eta = int(total * current_pause / 60) + 1
+
+    await update.message.reply_text(
+        f"📋 Хешей в списке: <b>{total}</b>\n"
+        f"Реестров: {len(sheets_data)}\n"
+        f"Пауза {current_pause}с, ориентировочно ~{eta} мин\n\n"
+        f"Прогон можно прервать и запустить заново: уже отмеченные строки "
+        f"пропускаются.",
+        parse_mode="HTML"
+    )
+
+    used_buf = UsedHashBuffer(spreadsheet)
+    seen = {}                  # хеш -> где он уже встретился в этом списке
+    marked = already = 0
+    not_found, dup_list, unverified, mismatches, err_list = [], [], [], [], []
+    last_error = ""
+
+    for n, tx_hash in enumerate(hashes, 1):
         had_error = False
         try:
-            if tx_hash.lower() in seen_in_run:
-                duplicates.append(tx_hash)
-                logger.info(f"[{i+1}/{total}] Дубль в файле: {tx_hash[:20]}")
-                try:
-                    class AdminUser:
-                        username = "checkall"
-                        id = ADMIN_ID
-                    await save_duplicate(spreadsheet, tx_hash, AdminUser())
-                except Exception as e:
-                    logger.error(f"Ошибка записи дубля: {e}")
+            key = tx_hash.lower()
 
-            elif is_duplicate_hash(tx_hash):
-                duplicates.append(tx_hash)
-                found_count += 1
-                logger.info(f"[{i+1}/{total}] Уже в использованных: {tx_hash[:20]}")
-                try:
-                    class AdminUser:
-                        username = "checkall"
-                        id = ADMIN_ID
-                    await save_duplicate(spreadsheet, tx_hash, AdminUser())
-                except Exception as e:
-                    logger.error(f"Ошибка записи дубля: {e}")
+            # дубль — это хеш, встретившийся ДВАЖДЫ В СПИСКЕ, то есть
+            # присланный в чат повторно. Строку при этом не трогаем.
+            if key in seen:
+                dup_list.append(f"{tx_hash} — повтор, первый раз {seen[key]}")
+                await save_duplicate(spreadsheet, tx_hash, _RunUser())
+                logger.info(f"[{n}/{total}] повтор в списке: {tx_hash[:20]}")
+                continue
 
-            else:
-                seen_in_run.add(tx_hash.lower())
-                sheet, row_index, row, binding = find_hash_in_loaded_data(tx_hash, sheets_data)
-                if sheet and row_index:
-                    si = binding["status"]
-                    status = row[si] if len(row) > si else ""
-                    hash_amount = ""
-                    if not status:
-                        result, hash_amount, recon = await verify_and_write_tron_data(
-                            sheet, binding, row_index, tx_hash, row
-                        )
-                        logger.info(f"[{i+1}/{total}] Обработан: {tx_hash[:20]} — {result}")
-                        if recon.startswith("⚠️"):
-                            mismatches.append(f"{tx_hash} — {recon}")
-                    else:
-                        logger.info(f"[{i+1}/{total}] Уже обработан: {tx_hash[:20]}")
-                    found_count += 1
-                    await save_used_hash(spreadsheet, tx_hash, ADMIN_ID, "@checkall", hash_amount)
-                else:
-                    not_found.append(tx_hash)
-                    logger.info(f"[{i+1}/{total}] Не найден: {tx_hash[:20]}")
+            sheet, row_index, row, binding = find_hash_in_loaded_data(tx_hash, sheets_data)
 
-                    class AdminUser:
-                        username = "checkall"
-                        id = ADMIN_ID
-                    await save_not_found(spreadsheet, tx_hash, AdminUser(), reason="не найден (/checkall)")
+            if not sheet:
+                # оператор прислал хеш, которого нет ни в одном реестре
+                not_found.append(tx_hash)
+                await save_not_found(spreadsheet, tx_hash, _RunUser(),
+                                     reason="нет ни в одном реестре (/checkall)")
+                logger.info(f"[{n}/{total}] нет в реестрах: {tx_hash[:20]}")
+                continue
+
+            title = sheet.title
+            where = f"{title}!{row_index}"
+            seen[key] = where
+
+            si = binding["status"]
+            if len(row) > si and row[si].strip():
+                already += 1
+                logger.info(f"[{n}/{total}] {where}: уже отмечен")
+                continue
+
+            res = await mark_sent_and_verify(sheet, binding, row_index, tx_hash, row)
+            marked += 1
+            stats[title]["new"] += 1
+
+            if not res["verified"]:
+                unverified.append(f"{where} — Tronscan не ответил")
+            elif res["recon"].startswith("⚠️"):
+                mismatches.append(f"{where} — {res['recon']}")
+
+            used_buf.add(tx_hash, ADMIN_ID, "@checkall", res["amount"])
+            await used_buf.maybe_flush()
+            logger.info(f"[{n}/{total}] {where}: отмечен, проверен={res['verified']}")
 
         except Exception as e:
             had_error = True
-            errors.append(tx_hash)
-            logger.error(f"Ошибка при проверке {tx_hash[:20]}: {e}")
+            last_error = str(e)
+            err_list.append(f"{tx_hash[:20]}… — {last_error[:90]}")
+            logger.error(f"[{n}/{total}] Ошибка на {tx_hash[:20]}: {e}")
             try:
-                class AdminUser:
-                    username = "checkall"
-                    id = ADMIN_ID
-                await save_error(spreadsheet, tx_hash, str(e)[:100], AdminUser())
+                await save_error(spreadsheet, tx_hash, last_error[:100], _RunUser())
             except Exception:
                 pass
 
-        # Адаптивная пауза
-        if had_error and "429" in str(errors[-1] if errors else ""):
+        # Адаптивная пауза. Раньше здесь искали "429" в списке ХЕШЕЙ —
+        # условие не срабатывало никогда, и пауза не росла.
+        if had_error and any(m in last_error for m in ("429", "RATE_LIMIT", "Quota")):
             current_pause = min(current_pause * 1.5, MAX_PAUSE)
-            logger.info(f"Пауза увеличена до {current_pause:.1f}с")
+            logger.warning(f"Квота: пауза увеличена до {current_pause:.1f}с")
         elif not had_error and current_pause > MIN_PAUSE:
             current_pause = max(current_pause * 0.9, MIN_PAUSE)
 
-        # Сохраняем прогресс каждые 10 хешей чтобы не превышать write лимит
-        if (i + 1) % 10 == 0:
-            save_checkall_progress(spreadsheet, i + 1, found_count, not_found, errors, duplicates, current_pause)
-
+        checkall_state["done"] = n
         await asyncio.sleep(current_pause)
 
-        if (i + 1) % 100 == 0:
+        if n % 100 == 0:
             await update.message.reply_text(
-                f"⏳ Прогресс: {i+1}/{total}\n"
-                f"✅ Найдено: {found_count}\n"
-                f"❌ Не найдено: {len(not_found)}\n"
-                f"♻️ Дублей: {len(duplicates)}\n"
-                f"⚠️ Ошибок: {len(errors)}\n"
-                f"⏱ Пауза: {current_pause:.1f}с"
+                f"⏳ {n}/{total} · отмечено {marked} · уже было {already} · "
+                f"нет в реестрах {len(not_found)} · ошибок {len(err_list)} · "
+                f"пауза {current_pause:.1f}с"
             )
 
-    clear_checkall_progress(spreadsheet)
+    await used_buf.flush()
 
-    try:
-        await update.message.reply_text(
-            f"✅ <b>Проверка завершена!</b>\n\n"
-            f"Всего хешей: {total}\n"
-            f"Найдено и обработано: {found_count}\n"
-            f"Не найдено в таблице: {len(not_found)}\n"
-            f"Дублей пропущено: {len(duplicates)}\n"
-            f"Ошибок: {len(errors)}\n"
-            f"Расхождений по сумме: {len(mismatches)}",
-            parse_mode="HTML"
-        )
-        if mismatches:
-            chunk = 30
-            for idx in range(0, len(mismatches), chunk):
-                part = mismatches[idx:idx + chunk]
-                lines = [f"⚠️ <b>Расхождения по сумме "
-                         f"({idx+1}-{idx+len(part)} из {len(mismatches)}):</b>\n"]
-                for m in part:
-                    lines.append(f"<code>{m}</code>")
-                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-        if not_found:
-            chunk_size = 50
-            for idx in range(0, len(not_found), chunk_size):
-                chunk = not_found[idx:idx + chunk_size]
-                lines = [f"❌ <b>Не найдено ({idx+1}-{idx+len(chunk)} из {len(not_found)}):</b>\n"]
-                for h in chunk:
-                    lines.append(f"<code>{h}</code>")
-                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Ошибка отправки финального отчёта: {e}")
+    await update.message.reply_text(
+        f"✅ <b>Прогон завершён</b>\n\n"
+        f"Хешей в списке: {total}\n"
+        f"Отмечено «отправлен в чат»: {marked}\n"
+        f"Уже были отмечены: {already}\n"
+        f"Повторов в списке: {len(dup_list)}\n"
+        f"Нет ни в одном реестре: {len(not_found)}\n"
+        f"Не проверены в сети (API молчал): {len(unverified)}\n"
+        f"Расхождений по сумме: {len(mismatches)}\n"
+        f"Ошибок: {len(err_list)}",
+        parse_mode="HTML"
+    )
+
+    # ---- главный отчёт: кто не отчитался -----------------------------
+    rows = ["📊 <b>Дисциплина по реестрам</b>", ""]
+    silent_total = 0
+    for title in sorted(stats, key=lambda t: -(stats[t]["total"]
+                                               - stats[t]["was_marked"]
+                                               - stats[t]["new"])):
+        st = stats[title]
+        if st["total"] == 0:
+            continue
+        silent = st["total"] - st["was_marked"] - st["new"]
+        silent_total += silent
+        flag = "✅" if silent == 0 else "⚠️"
+        rows.append(f"{flag} <b>{title}</b> — строк {st['total']} · "
+                    f"отмечено {st['was_marked'] + st['new']} · "
+                    f"без отчёта <b>{silent}</b>")
+    rows.insert(1, f"Всего строк без отчёта: <b>{silent_total}</b>")
+    rows.append("")
+    rows.append("<i>«Без отчёта» — хеш есть в реестре, но его не было "
+                "в выгруженном списке. Точность зависит от полноты выгрузки.</i>")
+    for part in chunk_lines(rows):
+        await update.message.reply_text(part, parse_mode="HTML")
+
+    for caption, items in (("❗ <b>Нет ни в одном реестре</b>", not_found),
+                           ("⚠️ <b>Расхождения по сумме</b>", mismatches),
+                           ("🔁 <b>Повторы в списке</b>", dup_list),
+                           ("🕓 <b>Не проверены — Tronscan молчал</b>", unverified),
+                           ("❌ <b>Ошибки</b>", err_list)):
+        if not items:
+            continue
+        body = [caption] + [f"<code>{x}</code>" for x in items]
+        for part in chunk_lines(body):
+            await update.message.reply_text(part, parse_mode="HTML")
+
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMIN_IDS:
@@ -1443,7 +1583,10 @@ async def post_init(application):
         used_hashes_cache = set()
         pending_checks = {}
 
-    asyncio.create_task(delayed_check_loop(application))
+    # Ссылку на задачу держим: без неё сборщик мусора вправе убить корутину.
+    task = asyncio.create_task(delayed_check_loop(application))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
