@@ -16,8 +16,28 @@ from google.oauth2.service_account import Credentials
 # НАСТРОЙКИ
 # ========================
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-ADMIN_ID          = int(os.environ["ADMIN_ID"])  # главный админ (для обратной совместимости)
-ADMIN_IDS         = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", os.environ["ADMIN_ID"]).split(",")]
+def _parse_admin_ids() -> list:
+    """
+    Админы берутся из ADMIN_IDS. ADMIN_ID оставлен только как запасной
+    источник для старых сред и сам по себе ничего не значит: раньше в него
+    по ошибке вписывали список, и бот падал с невнятным ValueError про int().
+    """
+    raw = os.environ.get("ADMIN_IDS") or os.environ.get("ADMIN_ID", "")
+    ids = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.lstrip("-").isdigit():
+            raise ValueError(f"ADMIN_IDS: '{part}' не похоже на telegram id")
+        ids.append(int(part))
+    if not ids:
+        raise ValueError("не задан ни ADMIN_IDS, ни ADMIN_ID")
+    return ids
+
+
+ADMIN_IDS         = _parse_admin_ids()
+ADMIN_ID          = ADMIN_IDS[0]   # главный админ — просто первый из списка
 SPREADSHEET_ID    = os.environ["SPREADSHEET_ID"]
 TRON_API_KEY      = os.environ["TRON_API_KEY"]
 CHECK_DELAY_HOURS = 1
@@ -38,6 +58,10 @@ GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 # ========================
 SHEET_MARKER     = "реестр"           # обрабатываются только листы с этим словом в названии
 AMOUNT_TOLERANCE = Decimal("0.01")    # допустимое расхождение сумм, USDT
+
+# Как может называться колонка с заявленной суммой. У разных команд это
+# «Сумма USDT», «Кол-во USDT» и так далее — список открытый.
+AMOUNT_WORDS = ("сумма", "кол-во", "колво", "количество")
 
 # Заголовки бота — четыре колонки сразу за колонкой хеша.
 # Первая называет ФАКТ О ЧЕЛОВЕКЕ: оператор прислал этот хеш в чат.
@@ -121,10 +145,16 @@ def bind_columns(rows: list):
     if idx_hash is None:
         return None, "в строке 1 нет заголовка с 'хеш'"
 
-    # заявленная оператором сумма — ближайший слева заголовок со словом 'сумма'
+    # Заявленная сумма ищется ВЛЕВО от хеша и только внутри одного блока:
+    # упёрлись в пустой заголовок — блок кончился, дальше чужая территория.
+    # Без этой границы бот на листе Lux ушёл за 23 колонки и подобрал
+    # постороннюю «сумму» из совсем другой части таблицы.
     idx_declared = None
     for i in range(idx_hash - 1, -1, -1):
-        if "сумма" in _norm(header[i]):
+        cell = _norm(header[i])
+        if not cell:
+            break
+        if any(w in cell for w in AMOUNT_WORDS):
             idx_declared = i
             break
 
@@ -451,20 +481,49 @@ async def save_pending_queue(spreadsheet):
 # HASHES TO CHECK
 # Структура: хеш
 # ========================
-def load_hashes_to_check(spreadsheet) -> list:
+HASH_RE = re.compile(r"^[0-9a-fA-F]{60,72}$")
+
+
+def normalize_hash(value) -> str:
+    """'0xAbC…' -> 'abc…'. Не похоже на хеш — пустая строка."""
+    h = str(value or "").strip()
+    if h[:2].lower() == "0x":
+        h = h[2:]
+    return h.lower() if HASH_RE.match(h) else ""
+
+
+def load_hashes_to_check(spreadsheet) -> tuple:
+    """
+    Возвращает (хеши, сколько строк отброшено).
+
+    Разбор нарочно терпимый: список приходит из выгрузки чата, и в нём
+    попадаются заголовок, пустые строки, заглавные буквы и префикс 0x.
+    Прежний код опознавал заголовок буквальным сравнением с ["хеш"] —
+    любая мелочь вроде лишней колонки рядом ломала это, и заголовок
+    уезжал в проверку как хеш.
+    """
     try:
         sheet = get_or_create_sheet(spreadsheet, "_хеши_для_проверки", rows=5000, cols=1)
         all_rows = sheet.get_all_values()
         if not all_rows:
             sheet.append_row(["хеш"])
-            return []
-        start = 1 if all_rows[0] == ["хеш"] else 0
-        hashes = [row[0].strip() for row in all_rows[start:] if row and row[0].strip()]
-        logger.info(f"Загружено {len(hashes)} хешей для checkall")
-        return hashes
+            return [], 0
+        hashes, skipped = [], 0
+        for row in all_rows:
+            raw = row[0].strip() if row else ""
+            if not raw:
+                continue
+            h = normalize_hash(raw)
+            if h:
+                hashes.append(h)
+            else:
+                skipped += 1                      # заголовок или мусор
+        logger.info(f"Загружено {len(hashes)} хешей для checkall, "
+                    f"отброшено строк: {skipped}")
+        return hashes, skipped
     except Exception as e:
         logger.error(f"Ошибка загрузки хешей_для_проверки: {e}")
-        return []
+        return [], 0
 
 # ========================
 # GOOGLE SHEETS — ПОИСК
@@ -1334,7 +1393,7 @@ async def checkall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def checkall_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spreadsheet = get_spreadsheet()
 
-    hashes = load_hashes_to_check(spreadsheet)
+    hashes, skipped_lines = load_hashes_to_check(spreadsheet)
     if not hashes:
         await update.message.reply_text(
             "❌ Лист <b>_хеши_для_проверки</b> пуст.\n\n"
@@ -1344,7 +1403,10 @@ async def checkall_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(f"🔄 Читаю реестры... (хешей в списке: {len(hashes)})")
+    note = f" · отброшено строк: {skipped_lines}" if skipped_lines else ""
+    await update.message.reply_text(
+        f"🔄 Читаю реестры... (хешей в списке: {len(hashes)}{note})"
+    )
     try:
         sheets_data = await load_all_sheets_data(spreadsheet)
     except Exception as e:
